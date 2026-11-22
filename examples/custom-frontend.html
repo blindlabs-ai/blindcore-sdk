@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BlindCore Custom Frontend Starter</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+    textarea, input, button { width: 100%; margin: 0.4rem 0; padding: 0.6rem; box-sizing: border-box; }
+    pre { background: #111; color: #0f0; padding: 1rem; overflow-x: auto; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h1>BlindCore Zero-Knowledge Starter</h1>
+  <p>Encrypts and signs in-browser via WebCrypto before anything leaves your device.</p>
+
+  <input id="apiUrl" value="https://api.blindcore.io" placeholder="BlindCore API Base URL" />
+  <textarea id="secretText" rows="4" placeholder="Type a confidential note or contract...">Mutual NDA v1.0</textarea>
+  <button id="runDemo">Encrypt (AES-256-GCM + PAD2) &amp; Sign (ECDSA P-256)</button>
+  <pre id="output">Click the button to run client-side crypto...</pre>
+
+  <script type="module">
+    import { BlindCrypto, BlindCoreClient, BlindSignClient } from "../js/blindcore-web.js";
+
+    const out = document.getElementById("output");
+    document.getElementById("runDemo").addEventListener("click", async () => {
+      const text = document.getElementById("secretText").value;
+      const baseUrl = document.getElementById("apiUrl").value;
+
+      // 1. Generate client-side keys (never leave the browser)
+      const aesKey = BlindCrypto.generateAesKey();
+      const signingPair = await BlindCrypto.generateSigningKeyPair();
+
+      // 2. Encrypt with AES-256-GCM + power-of-2 PAD2 length hiding
+      const envelope = await BlindCrypto.encryptAesGcm(text, aesKey, { pad: true });
+      const digestHex = await BlindCrypto.sha256Hex(text);
+      const signature = await BlindCrypto.signBytes(signingPair.privateKey, digestHex);
+      const verified = await BlindCrypto.verifyBytes(signingPair.publicKey, digestHex, signature);
+
+      // 3. Decrypt locally to prove zero-loss roundtrip
+      const decrypted = BlindCrypto.decodeUtf8(await BlindCrypto.decryptAesGcm(envelope, aesKey));
+
+      // 4. Ready to wire to BlindCoreClient / BlindSignClient
+      const core = new BlindCoreClient({
+        baseUrl,
+        onPaymentRequired: async (challenge) => {
+          console.log("HTTP 402 challenge received:", challenge.protocols);
+          return null; // Return { "X-PAYMENT": "<proof>" } to auto-retry
+        }
+      });
+      const sign = new BlindSignClient(core);
+
+      out.textContent = JSON.stringify({
+        clientReady: Boolean(sign),
+        digestHex,
+        signatureVerified: verified,
+        envelope,
+        decryptedRoundtrip: decrypted
+      }, null, 2);
+    });
+  </script>
+</body>
+</html>

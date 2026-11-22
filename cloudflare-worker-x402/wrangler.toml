@@ -1,0 +1,13 @@
+# BlindCore x402 v2 Confidential Compute Edge Worker
+# SPDX-License-Identifier: Apache-2.0 | Copyright 2026 Blind Labs (https://blindlabs.ai)
+
+name = "blindcore-x402-worker"
+main = "src/index.ts"
+compatibility_date = "2025-11-01"
+
+[vars]
+BLINDCORE_GATE_URL = "https://api.blindlabs.ai/testnet"
+
+# Optional server-side prepaid session token (NEVER commit live tokens here).
+# Provision as an encrypted Cloudflare Worker secret when paying on behalf of edge callers:
+#   npx wrangler secret put BLINDCORE_SESSION_TOKEN

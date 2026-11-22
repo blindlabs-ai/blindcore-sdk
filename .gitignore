@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+.env
+env.local
+broadcast/
+cache/
+out/
+.clarinet/
+.wrangler/
