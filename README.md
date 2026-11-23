@@ -19,7 +19,7 @@ Official zero-dependency Python 3 and JavaScript/TypeScript (ESM) client SDK, Mo
 - **End-to-End Client Envelope Security:** Built-in `AES-256-GCM` encryption with `PAD2` power-of-2 length-hiding padding, `ECDSA P-256` detached document and post signatures, and `ECDH P-256` shared-key derivation for encrypted direct messages and group key rotation.
 - **Full BlindCore Surface in One Kit:** Unified `BlindCoreClient` (SQL, Blind Homomorphic OLAP, BlindJSONB Encrypted NoSQL, encrypted `SKLEARN_MNB` scoring, NDJSON streaming, RFC 6455 live WebSockets), `BlindSignClient`, `BlindFeedClient`, and `BlindMailClient`.
 - **Native AI Agent & Tri-Rail `HTTP 402` Monetization:** Ships a zero-dependency JSON-RPC 2.0 `MCP` stdio server (`mcp/mcp_server.py`), a Coinbase AgentKit provider (`mcp/agentkit_provider.py`), a reference Tri-Rail `HTTP 402` gateway (`gate/blindcore_trirail_gate.py`), and a zero-dependency Cloudflare Worker `x402 v2` edge proxy (`cloudflare-worker-x402/`).
-- **Verifiable State-Root Anchoring & Reproducible Benchmarks:** Includes Base L2 Solidity (`BlindCoreRootAnchor.sol`) and Stacks Clarity (`blindcore-root-anchor.clar`) state-root anchors, `4` standalone confidential compute sample apps (`apps/`), and `9` reproducible Jupyter notebooks (`notebooks/`).
+- **Verifiable State-Root Anchoring & Reproducible Benchmarks:** Includes Base L2 Solidity (`BlindCoreRootAnchor.sol`) and Stacks Clarity (`blindcore-root-anchor.clar`) state-root anchors, `4` standalone confidential compute sample apps (`apps/`), and `10` reproducible Jupyter notebooks (`notebooks/`), including the [3-Pillar Encrypted Storage, Query & ML Benchmark](notebooks/10_encrypted_storage_compression_benchmark.ipynb).
 
 ---
 
@@ -157,7 +157,7 @@ gate/test_trirail_redteam_fuzz.py # Deterministic 12,221-probe red-team & replay
 apps/app01..app04_*.py            # Confidential compute sample apps (Brain, Darkpool, Fraud, Nostr)
 examples/01..03_*.py              # Base x402, Lightning L402, and Stacks sBTC end-to-end flows
 examples/custom-frontend.html     # Single-file zero-knowledge browser starter
-notebooks/01..09_*.ipynb          # Reproducible notebooks (HIPAA, Fraud, Defense, Blind OLAP/JSONB)
+notebooks/01..10_*.ipynb          # Reproducible notebooks (HIPAA, Fraud, Defense, Blind OLAP/JSONB, 3-Pillar Benchmark)
 cloudflare-worker-x402/           # Zero-dep Cloudflare Worker x402 v2 edge scoring proxy
 contracts/base/                   # Base L2 Solidity state-root anchor (BlindCoreRootAnchor.sol)
 contracts/stacks/                 # Stacks Clarity state-root anchor (blindcore-root-anchor.clar)
