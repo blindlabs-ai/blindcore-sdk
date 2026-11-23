@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Blind Labs (https://blindlabs.ai)
-pragma solidity ^0.8.24;
+pragma solidity 0.8.24;
 
 /// @title BlindCoreRootAnchor
 /// @notice Base L2 epoch state-root anchor and EIP-712 v2 receipt settlement
@@ -107,6 +107,7 @@ contract BlindCoreRootAnchor {
         authorizedRelayers[initialSequencer] = true;
         INITIAL_CHAIN_ID = block.chainid;
         INITIAL_DOMAIN_SEPARATOR = _computeDomainSeparator();
+        emit RelayerUpdated(initialSequencer, true);
     }
 
     // -------------------------------------------------------------------------
@@ -180,8 +181,11 @@ contract BlindCoreRootAnchor {
         if (msg.sender != pendingSequencer) revert Unauthorized();
         address prev = sequencer;
         sequencer = msg.sender;
+        authorizedRelayers[prev] = false;
         authorizedRelayers[msg.sender] = true;
         pendingSequencer = address(0);
+        emit RelayerUpdated(prev, false);
+        emit RelayerUpdated(msg.sender, true);
         emit SequencerAccepted(prev, msg.sender);
     }
 
@@ -254,10 +258,18 @@ contract BlindCoreRootAnchor {
     // ERC-8004 Validation Registry & ACP (ERC-8183) Consumer Views
     // -------------------------------------------------------------------------
 
+    function isRelayer(address account) external view returns (bool) {
+        return account == sequencer || authorizedRelayers[account];
+    }
+
     function isReceiptSettled(bytes32 digest) external view returns (bool) {
         return settledDigests[digest];
     }
 
+    /// @notice Validate a settled receipt for ERC-8004 / ACP consumers.
+    /// @dev Passing expectedPayer == address(0) intentionally acts as a wildcard
+    ///      payer match; consumers requiring strict payer binding MUST pass a
+    ///      non-zero expectedPayer address.
     function validateReceiptForAgent(
         bytes32 digest,
         address expectedPayer
