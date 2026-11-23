@@ -215,7 +215,7 @@ class PaymentRequiredError(Exception):
         self.challenge = challenge
 
 
-class ApiError(Exception):
+class ApiError(RuntimeError):
     """Raised when an endpoint returns a non-2xx HTTP status."""
 
     def __init__(self, message: str, status: int, body: Any = None) -> None:
@@ -264,19 +264,38 @@ def from_base64url(text: str) -> bytes:
 def _parse_payment_challenge(headers: Dict[str, str], body: Any) -> Dict[str, Any]:
     lower = {k.lower(): v for k, v in headers.items()}
     www_auth = lower.get("www-authenticate", "")
-    x_pay_req = lower.get("x-payment-required", "")
+    pay_req = lower.get("payment-required") or lower.get("x-payment-required", "")
+    stacks_pay_req = lower.get("x-stacks-payment-required", "")
+    body_dict = body if isinstance(body, dict) else {}
+    extensions = body_dict.get("extensions") if isinstance(body_dict.get("extensions"), dict) else {}
+    l402_ext = extensions.get("lightning_l402") if isinstance(extensions.get("lightning_l402"), dict) else {}
+    stacks_ext = extensions.get("stacks_sbtc") if isinstance(extensions.get("stacks_sbtc"), dict) else {}
+
     protocols: List[str] = []
-    if x_pay_req or (isinstance(body, dict) and body.get("x402Version")) or "x402" in www_auth.lower():
+    if pay_req or body_dict.get("x402Version") or "x402" in www_auth.lower():
         protocols.append("x402")
-    if "l402" in www_auth.lower() or (isinstance(body, dict) and (body.get("macaroon") or body.get("invoice"))):
+    if (
+        "l402" in www_auth.lower()
+        or body_dict.get("macaroon")
+        or body_dict.get("invoice")
+        or bool(l402_ext.get("enabled"))
+    ):
         protocols.append("L402")
-    if "sbtc" in www_auth.lower() or (isinstance(body, dict) and (body.get("sbtcAddress") or body.get("sbtc"))):
+    if (
+        stacks_pay_req
+        or "sbtc" in www_auth.lower()
+        or body_dict.get("sbtcAddress")
+        or body_dict.get("sbtc")
+        or bool(stacks_ext)
+    ):
         protocols.append("sBTC")
     return {
         "status": 402,
         "protocols": protocols,
         "www_authenticate": www_auth,
-        "x_payment_required": x_pay_req,
+        "payment_required": pay_req,
+        "x_payment_required": pay_req,
+        "stacks_payment_required": stacks_pay_req,
         "body": body,
     }
 
@@ -446,34 +465,89 @@ class BlindCoreClient:
         body: bytes | None = None,
         content_type: str | None = None,
         auth: bool = True,
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> tuple[int, dict[str, str], bytes]:
         if _has_ctl(path) or not path.startswith("/"):
             raise ValueError("path must begin with '/' and contain no control characters")
+        hdrs = self._headers(content_type, auth=auth)
+        if extra_headers:
+            for k, v in extra_headers.items():
+                if not isinstance(k, str) or not isinstance(v, str) or _has_ctl(k) or _has_ctl(v):
+                    raise ValueError("extra_headers keys and values must be strings without control characters")
+                hdrs[k] = v
         conn = self._open_conn()
         try:
-            conn.request(method, path, body=body, headers=self._headers(content_type, auth=auth))
+            conn.request(method, path, body=body, headers=hdrs)
             resp = conn.getresponse()
-            hdrs = {k.lower(): v for k, v in resp.getheaders()}
+            resp_hdrs = {k.lower(): v for k, v in resp.getheaders()}
             data = self._read_bounded_body(resp)
-            return resp.status, hdrs, data
+            return resp.status, resp_hdrs, data
         finally:
             conn.close()
 
-    def _post_bytes(self, path: str, body: bytes, content_type: str) -> bytes:
-        status, _, data = self.request_raw("POST", path, body=body, content_type=content_type, auth=True)
-        if status < 200 or status >= 300:
-            raise RuntimeError(f"HTTP {status}: {data.decode('utf-8', 'replace').strip()}")
-        return data
+    def _request_bytes_with_402(
+        self,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        content_type: str | None = None,
+        auth: bool = True,
+        body_for_hook: Any = None,
+    ) -> bytes:
+        status, resp_hdrs, data = self.request_raw(
+            method, path, body=body, content_type=content_type, auth=auth
+        )
+        if status == 402:
+            parsed = self._parse_json(data.decode("utf-8", errors="replace"))
+            challenge = _parse_payment_challenge(resp_hdrs, parsed)
+            if self.on_payment_required is not None:
+                url = f"{self.base_url}{path}"
+                extra = self.on_payment_required(
+                    challenge, {"url": url, "method": method, "body": body_for_hook}
+                )
+                if isinstance(extra, dict) and extra:
+                    status, _, data = self.request_raw(
+                        method,
+                        path,
+                        body=body,
+                        content_type=content_type,
+                        auth=auth,
+                        extra_headers=extra,
+                    )
+                    if 200 <= status < 300:
+                        return data
+                    retry_parsed = self._parse_json(data.decode("utf-8", errors="replace"))
+                    raise ApiError(self._err_msg(status, retry_parsed), status, retry_parsed)
+            raise PaymentRequiredError("HTTP 402 Payment Required", challenge)
+        if 200 <= status < 300:
+            return data
+        parsed = self._parse_json(data.decode("utf-8", errors="replace"))
+        raise ApiError(self._err_msg(status, parsed), status, parsed)
+
+    def _post_bytes(
+        self,
+        path: str,
+        body: bytes,
+        content_type: str,
+        body_for_hook: Any = None,
+    ) -> bytes:
+        return self._request_bytes_with_402(
+            "POST",
+            path,
+            body=body,
+            content_type=content_type,
+            auth=True,
+            body_for_hook=body_for_hook if body_for_hook is not None else body,
+        )
 
     def get_json(self, path: str, auth: bool = True) -> Any:
-        status, _, data = self.request_raw("GET", path, body=None, content_type=None, auth=auth)
-        if status < 200 or status >= 300:
-            raise RuntimeError(f"HTTP {status}: {data.decode('utf-8', 'replace').strip()}")
+        data = self._request_bytes_with_402("GET", path, body=None, content_type=None, auth=auth)
         return json.loads(data.decode("utf-8"))
 
     def post_json(self, path: str, payload: dict[str, Any]) -> Any:
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        return json.loads(self._post_bytes(path, encoded, "application/json").decode("utf-8"))
+        data = self._post_bytes(path, encoded, "application/json", body_for_hook=payload)
+        return json.loads(data.decode("utf-8"))
 
     def create_blind_table(
         self,
@@ -756,7 +830,12 @@ class BlindCoreClient:
         if not q:
             raise ValueError("SQL query must not be empty")
         return json.loads(
-            self._post_bytes("/api/v1/query?format=json", q.encode("utf-8"), "text/plain; charset=utf-8").decode("utf-8")
+            self._post_bytes(
+                "/api/v1/query?format=json",
+                q.encode("utf-8"),
+                "text/plain; charset=utf-8",
+                body_for_hook=q,
+            ).decode("utf-8")
         )
 
     def query_ndjson_stream(self, sql: str) -> Iterator[Any]:
@@ -935,7 +1014,7 @@ class BlindSignClient:
         signers: Optional[List[str]] = None,
         signature: Optional[str] = None,
         key_base64url: str = "",
-        app_origin: str = "https://sign.blindcore.io",
+        app_origin: str = "https://blindlabs.ai/sign",
     ) -> Dict[str, Any]:
         resp = self.core.request(
             "/v1/sign/envelopes",
@@ -1008,7 +1087,7 @@ class BlindSignClient:
         ttl_seconds: int = 3600,
         max_views: int = 1,
         key_base64url: str = "",
-        app_origin: str = "https://sign.blindcore.io",
+        app_origin: str = "https://blindlabs.ai/sign",
     ) -> Dict[str, Any]:
         resp = self.core.request(
             "/v1/vault/shares",

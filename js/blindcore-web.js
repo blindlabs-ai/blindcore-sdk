@@ -362,16 +362,48 @@ export class PaymentRequiredError extends Error {
 
 function parsePaymentChallenge(response, body) {
   const wwwAuth = response.headers?.get("www-authenticate") || "";
-  const xPaymentReq = response.headers?.get("x-payment-required") || "";
+  const paymentReq =
+    response.headers?.get("payment-required") ||
+    response.headers?.get("x-payment-required") ||
+    "";
+  const stacksPayReq = response.headers?.get("x-stacks-payment-required") || "";
+  const bodyObj = body && typeof body === "object" ? body : {};
+  const extensions =
+    bodyObj.extensions && typeof bodyObj.extensions === "object" ? bodyObj.extensions : {};
+  const l402Ext =
+    extensions.lightning_l402 && typeof extensions.lightning_l402 === "object"
+      ? extensions.lightning_l402
+      : null;
+  const stacksExt =
+    extensions.stacks_sbtc && typeof extensions.stacks_sbtc === "object"
+      ? extensions.stacks_sbtc
+      : null;
   const protocols = [];
-  if (xPaymentReq || body?.x402Version || /x402/i.test(wwwAuth)) protocols.push("x402");
-  if (/L402/i.test(wwwAuth) || body?.macaroon || body?.invoice) protocols.push("L402");
-  if (/sBTC/i.test(wwwAuth) || body?.sbtcAddress || body?.sbtc) protocols.push("sBTC");
+  if (paymentReq || bodyObj.x402Version || /x402/i.test(wwwAuth)) protocols.push("x402");
+  if (
+    /L402/i.test(wwwAuth) ||
+    bodyObj.macaroon ||
+    bodyObj.invoice ||
+    Boolean(l402Ext?.enabled)
+  ) {
+    protocols.push("L402");
+  }
+  if (
+    stacksPayReq ||
+    /sBTC/i.test(wwwAuth) ||
+    bodyObj.sbtcAddress ||
+    bodyObj.sbtc ||
+    Boolean(stacksExt)
+  ) {
+    protocols.push("sBTC");
+  }
   return {
     status: 402,
     protocols,
     wwwAuthenticate: wwwAuth,
-    xPaymentRequired: xPaymentReq,
+    paymentRequired: paymentReq,
+    xPaymentRequired: paymentReq,
+    stacksPaymentRequired: stacksPayReq,
     body
   };
 }
@@ -382,7 +414,7 @@ function parsePaymentChallenge(response, body) {
 export class BlindCoreClient {
   constructor(options = {}) {
     const {
-      baseUrl = "https://api.blindcore.io",
+      baseUrl = "https://api.blindlabs.ai",
       token = null,
       fetchImpl = globalThis.fetch,
       onPaymentRequired = null
@@ -408,8 +440,13 @@ export class BlindCoreClient {
     }
     let payload;
     if (body !== undefined) {
-      reqHeaders["Content-Type"] = "application/json";
-      payload = JSON.stringify(body);
+      const explicitCt = reqHeaders["Content-Type"] || reqHeaders["content-type"] || "";
+      if (typeof body === "string" && explicitCt && !explicitCt.toLowerCase().includes("application/json")) {
+        payload = body;
+      } else {
+        if (!explicitCt) reqHeaders["Content-Type"] = "application/json";
+        payload = JSON.stringify(body);
+      }
     }
 
     const res = await this.fetchImpl(url, { method, headers: reqHeaders, body: payload });
@@ -456,6 +493,43 @@ export class BlindCoreClient {
     return data;
   }
 
+  async health() {
+    return this.request("/health", { method: "GET" });
+  }
+
+  async pricing() {
+    return this.request("/api/v1/pricing", { method: "GET" });
+  }
+
+  async queryJson(sql) {
+    return this.request("/api/v1/query?format=json", {
+      method: "POST",
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+      body: String(sql)
+    });
+  }
+
+  async queryBlindJsonb(payload) {
+    return this.request("/api/v1/blind/jsonb/query", {
+      method: "POST",
+      body: payload
+    });
+  }
+
+  async ingestBlindJsonb(payload) {
+    return this.request("/api/v1/blind/jsonb/ingest", {
+      method: "POST",
+      body: payload
+    });
+  }
+
+  async queryBlind(payload) {
+    return this.request("/api/v1/blind/query", {
+      method: "POST",
+      body: payload
+    });
+  }
+
   async queryJsonb(collection, filter = {}, options = {}) {
     return this.request("/v1/jsonb/query", {
       method: "POST",
@@ -497,7 +571,7 @@ export class BlindSignClient {
     title = "Untitled Envelope",
     signers = [],
     signingPrivateKey,
-    appOrigin = "https://sign.blindcore.io"
+    appOrigin = "https://blindlabs.ai/sign"
   }) {
     const rawBytes = toUint8Array(fileBytes);
     const keyBytes = BlindCrypto.generateAesKey();
@@ -560,7 +634,7 @@ export class BlindSignClient {
     ttlSeconds = 3600,
     maxViews = 1,
     keyBase64Url = "",
-    appOrigin = "https://sign.blindcore.io"
+    appOrigin = "https://blindlabs.ai/sign"
   }) {
     const response = await this.core.request("/v1/vault/shares", {
       method: "POST",

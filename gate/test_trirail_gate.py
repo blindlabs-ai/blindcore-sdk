@@ -43,7 +43,9 @@ from gate.blindcore_trirail_gate import (  # noqa: E402
     GateConfig,
     PERMIT2_CANONICAL,
     PREPAID_MIN_MICRO_USDC,
+    PRICING_TIERS,
     STACKS_SBTC_MAINNET,
+    TriRailEngine,
     b64_json_decode,
     b64_json_encode,
     build_server,
@@ -952,6 +954,60 @@ class TriRailGatewayE2ETest(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             urllib.request.urlopen(big_req, timeout=10)
         self.assertEqual(ctx.exception.code, 413)
+
+    def test_09_cors_preflight_head_probes_and_mainnet_l402_guard(self) -> None:
+        # OPTIONS CORS preflight -> 204 with Access-Control-Allow-Origin: *
+        opt_req = urllib.request.Request(
+            f"{self.gate_url}/api/v1/blind/jsonb/query",
+            method="OPTIONS",
+        )
+        with urllib.request.urlopen(opt_req, timeout=10) as resp:
+            self.assertEqual(resp.status, 204)
+            self.assertEqual(resp.read(), b"")
+            self.assertEqual(resp.headers.get("Access-Control-Allow-Origin"), "*")
+            self.assertIn("OPTIONS", resp.headers.get("Access-Control-Allow-Methods") or "")
+            self.assertIn("PAYMENT-SIGNATURE", resp.headers.get("Access-Control-Allow-Headers") or "")
+            self.assertIn("PAYMENT-REQUIRED", resp.headers.get("Access-Control-Expose-Headers") or "")
+            self.assertEqual(resp.headers.get("Access-Control-Max-Age"), "86400")
+
+        # HEAD /health and /api/v1/pricing -> 200 with empty body and accurate Content-Length
+        for path in ("/health", "/api/v1/pricing"):
+            head_req = urllib.request.Request(f"{self.gate_url}{path}", method="HEAD")
+            with urllib.request.urlopen(head_req, timeout=10) as resp:
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(resp.read(), b"")
+                self.assertGreater(int(resp.headers.get("Content-Length") or "0"), 0)
+                self.assertEqual(resp.headers.get("Access-Control-Allow-Origin"), "*")
+
+        # Mainnet production config suppresses synthetic blindcoretest L402 stubs
+        with tempfile.TemporaryDirectory() as td:
+            prod_cfg = GateConfig(
+                listen_host="127.0.0.1",
+                listen_port=0,
+                upstream_url="http://127.0.0.1:1",
+                upstream_token="",
+                public_base_url="https://api.blindlabs.ai",
+                db_path=os.path.join(td, "prod_gate.db"),
+                base_network=BASE_MAINNET_CAIP2,
+                base_pay_to=BASE_PAY_TO,
+                stacks_network="mainnet",
+                stacks_pay_to=STACKS_PAY_TO,
+                trust_proxy_headers=True,
+                test_mode=True,
+            )
+            prod_engine = TriRailEngine(prod_cfg)
+            try:
+                hdrs, quote = prod_engine.build_402_response(
+                    PRICING_TIERS["CONTAINS"],
+                    "/api/v1/blind/jsonb/query",
+                    "0" * 64,
+                )
+                self.assertNotIn("WWW-Authenticate", hdrs)
+                self.assertFalse(quote["extensions"]["lightning_l402"]["enabled"])
+                self.assertEqual(quote["extensions"]["lightning_l402"]["invoice"], "")
+                self.assertNotIn("blindcoretest", json.dumps(quote))
+            finally:
+                prod_engine.close()
 
 
 if __name__ == "__main__":

@@ -27,11 +27,15 @@ class _MockBlindCoreHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
-    def _read_json(self):
+    def _read_body(self):
         length = int(self.headers.get("Content-Length", "0"))
         if length <= 0:
             return None
-        return json.loads(self.rfile.read(length).decode("utf-8"))
+        raw = self.rfile.read(length).decode("utf-8")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
 
     def _reply(self, status, payload, extra_headers=None):
         raw = json.dumps(payload).encode("utf-8")
@@ -45,13 +49,15 @@ class _MockBlindCoreHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _handle(self, method):
-        body = self._read_json()
+        body = self._read_body()
         self.__class__.recorded.append(
             {
                 "method": method,
                 "path": self.path,
                 "auth": self.headers.get("Authorization"),
                 "x_payment": self.headers.get("X-PAYMENT"),
+                "payment_signature": self.headers.get("PAYMENT-SIGNATURE"),
+                "stacks_payment_tx": self.headers.get("X-Stacks-Payment-Tx"),
                 "body": body,
             }
         )
@@ -62,6 +68,54 @@ class _MockBlindCoreHandler(http.server.BaseHTTPRequestHandler):
                 {
                     "WWW-Authenticate": 'L402 macaroon="m1", invoice="lnbc1"',
                     "X-Payment-Required": "x402-v2",
+                },
+            )
+            return
+        if self.path == "/api/v1/blind/jsonb/query" and not (
+            self.headers.get("PAYMENT-SIGNATURE") or self.headers.get("X-Stacks-Payment-Tx")
+        ):
+            self._reply(
+                402,
+                {
+                    "x402Version": 2,
+                    "error": "Payment required",
+                    "extensions": {
+                        "lightning_l402": {
+                            "enabled": False,
+                            "invoice": "",
+                            "macaroon": "",
+                            "paymentHash": "",
+                            "sats": 2,
+                        },
+                        "stacks_sbtc": {
+                            "network": "stacks:mainnet",
+                            "recipient": "SP3NM1CKTY7NA47G37BKMN3Z739PEB0GGVJCDA15M",
+                            "amountSats": 2,
+                        },
+                    },
+                },
+                {
+                    "PAYMENT-REQUIRED": "eyJ4NDAyVmVyc2lvbiI6Mn0=",
+                    "X-Stacks-Payment-Required": "eyJuZXR3b3JrIjoic3RhY2tzOm1haW5uZXQifQ==",
+                },
+            )
+            return
+        if self.path.startswith("/api/v1/query") and not self.headers.get("PAYMENT-SIGNATURE"):
+            self._reply(
+                402,
+                {
+                    "x402Version": 2,
+                    "extensions": {
+                        "lightning_l402": {
+                            "enabled": True,
+                            "invoice": "lnbc2n1live",
+                            "macaroon": "mac_live",
+                            "sats": 2,
+                        },
+                    },
+                },
+                {
+                    "PAYMENT-REQUIRED": "eyJ4NDAyVmVyc2lvbiI6Mn0=",
                 },
             )
             return
@@ -131,6 +185,45 @@ class TestBlindCorePythonSdk(unittest.TestCase):
         self.assertEqual(seen["protocols"], ["x402", "L402", "sBTC"])
         self.assertEqual(seen["method"], "POST")
 
+    def test_blind_jsonb_and_query_json_402_headers_and_defaults(self):
+        default_core = BlindCoreClient()
+        self.assertEqual(default_core.base_url, "https://api.blindlabs.ai")
+
+        core_no_hook = BlindCoreClient(base_url=self.base_url)
+        with self.assertRaises(PaymentRequiredError) as ctx:
+            core_no_hook.query_blind_jsonb(table="t", op="CONTAINS")
+        ch = ctx.exception.challenge
+        self.assertEqual(ch["protocols"], ["x402", "sBTC"])
+        self.assertNotIn("L402", ch["protocols"])
+        self.assertEqual(ch["payment_required"], "eyJ4NDAyVmVyc2lvbiI6Mn0=")
+        self.assertEqual(ch["x_payment_required"], "eyJ4NDAyVmVyc2lvbiI6Mn0=")
+        self.assertEqual(ch["stacks_payment_required"], "eyJuZXR3b3JrIjoic3RhY2tzOm1haW5uZXQifQ==")
+
+        # Retry hook on query_blind_jsonb with X-Stacks-Payment-Tx
+        seen_jb = {}
+
+        def pay_stacks(challenge, context):
+            seen_jb["protocols"] = challenge["protocols"]
+            seen_jb["url"] = context["url"]
+            return {"X-Stacks-Payment-Tx": "0x" + "ab" * 32}
+
+        core_stacks = BlindCoreClient(base_url=self.base_url, on_payment_required=pay_stacks)
+        res = core_stacks.query_blind_jsonb(table="t", op="CONTAINS")
+        self.assertTrue(res["ok"])
+        self.assertEqual(seen_jb["protocols"], ["x402", "sBTC"])
+        self.assertTrue(seen_jb["url"].endswith("/api/v1/blind/jsonb/query"))
+
+        # query_json also routes through 402 handler (and enabled lightning_l402 triggers L402)
+        with self.assertRaises(PaymentRequiredError) as ctx_sql:
+            core_no_hook.query_json("SELECT 1")
+        self.assertEqual(ctx_sql.exception.challenge["protocols"], ["x402", "L402"])
+
+        core_sql_hook = BlindCoreClient(
+            base_url=self.base_url,
+            on_payment_required=lambda ch, ctx: {"PAYMENT-SIGNATURE": "sig-ok"},
+        )
+        self.assertTrue(core_sql_hook.query_json("SELECT 1")["ok"])
+
     def test_all_clients_end_to_end(self):
         core = BlindCoreClient(base_url=self.base_url, token="tok_py")
         sign = BlindSignClient(core)
@@ -147,7 +240,7 @@ class TestBlindCorePythonSdk(unittest.TestCase):
             key_base64url="secretkey123",
         )
         self.assertEqual(env["envelope_id"], "env_py_1")
-        self.assertEqual(env["invite_link"], "https://sign.blindcore.io/#env=env_py_1&k=secretkey123")
+        self.assertEqual(env["invite_link"], "https://blindlabs.ai/sign/#env=env_py_1&k=secretkey123")
         self.assertTrue(
             sign.countersign_envelope(
                 envelope_id="env_py_1",
@@ -160,7 +253,7 @@ class TestBlindCorePythonSdk(unittest.TestCase):
         self.assertTrue(sign.store_vault_item(label="k1", encrypted_blob={"iv": "a"})["ok"])
         share = sign.create_temp_share(item_id="i1", key_base64url="k123")
         self.assertEqual(share["share_id"], "sh_py_1")
-        self.assertIn("#share=sh_py_1&k=k123", share["share_link"])
+        self.assertTrue(share["share_link"].startswith("https://blindlabs.ai/sign/#share=sh_py_1&k=k123"))
 
         self.assertTrue(
             feed.register_profile(

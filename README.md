@@ -30,16 +30,43 @@ Official zero-dependency Python 3 and JavaScript/TypeScript (ESM) client SDK, Mo
 Copy `js/blindcore-web.js` (and `js/blindcore-web.d.ts` for TypeScript IDE types) directly into your application:
 
 ```js
-import { BlindCrypto, BlindCoreClient, BlindSignClient } from "./js/blindcore-web.js";
+import {
+  BlindCrypto,
+  BlindCoreClient,
+  BlindSignClient,
+  PaymentRequiredError
+} from "./js/blindcore-web.js";
 
 const core = new BlindCoreClient({
   baseUrl: "https://api.blindlabs.ai",
   onPaymentRequired: async (challenge) => {
-    // Negotiate x402 v2 (Base USDC), L402 (Lightning), or sBTC and return retry headers:
-    // return { "PAYMENT-SIGNATURE": signedPaymentHeader };
+    // Negotiate x402 v2 (Base USDC) or Stacks sBTC and return retry headers:
+    // Base USDC (x402 v2): return { "PAYMENT-SIGNATURE": signedPaymentHeader };
+    // Stacks sBTC:         return { "X-Stacks-Payment-Tx": stacksTxId };
     return null;
   }
 });
+
+// Live discovery endpoints: GET /health and GET /api/v1/pricing
+const health = await core.health();
+const pricing = await core.pricing();
+
+// Metered encrypted BlindJSONB query: POST /api/v1/blind/jsonb/query
+try {
+  const res = await core.queryBlindJsonb({
+    table: "private_records",
+    op: "CONTAINS",
+    path: "/tags",
+    value: "priority"
+  });
+  console.log("BlindJSONB result:", res);
+} catch (err) {
+  if (err instanceof PaymentRequiredError) {
+    console.log("Protocols:", err.challenge.protocols);
+    console.log("x402 header:", Boolean(err.challenge.paymentRequired));
+    console.log("Stacks header:", Boolean(err.challenge.stacksPaymentRequired));
+  }
+}
 
 const sign = new BlindSignClient(core);
 const signer = await BlindCrypto.generateSigningKeyPair();
@@ -60,28 +87,43 @@ See [examples/custom-frontend.html](examples/custom-frontend.html) for a single-
 ### 2. Python 3 (`python/blindcore_sdk.py`)
 
 ```python
-from python.blindcore_sdk import BlindCoreClient, BlindMailClient, pad2, sha256_hex
+from python.blindcore_sdk import (
+    BlindCoreClient,
+    PaymentRequiredError,
+    pad2,
+    sha256_hex,
+)
 
 core = BlindCoreClient(
     base_url="https://api.blindlabs.ai",
-    token="your_api_token",
+    # Optional free-tier developer key (bl_live_*) for /api/v1/query & /api/v1/pricing:
+    # token="bl_live_...",
+    # Optional HTTP 402 payment hook returning {"PAYMENT-SIGNATURE": ...} or {"X-Stacks-Payment-Tx": ...}:
+    # on_payment_required=my_payment_hook,
 )
 
-# SQL & BlindJSONB encrypted NoSQL queries
-rows = core.query_json("SELECT 1")
-res = core.query_blind_jsonb(
-    table="private_records",
-    op="CONTAINS",
-    path="/tags",
-    value="priority",
-)
+# Live discovery routes: GET /health and GET /api/v1/pricing
+health = core.get_json("/health", auth=False)
+pricing = core.get_json("/api/v1/pricing", auth=False)
 
-# Transactional mail & passwordless magic-link authentication
-mail = BlindMailClient(core)
-mail.request_magic_link(
-    email="dev@example.com",
-    redirect_url="https://app.example.com/auth",
-)
+# SQL (POST /api/v1/query?format=json) & BlindJSONB (POST /api/v1/blind/jsonb/query)
+# Paid routes raise PaymentRequiredError when no payment header or hook is provided:
+try:
+    res = core.query_blind_jsonb(
+        table="private_records",
+        op="CONTAINS",
+        path="/tags",
+        value="priority",
+    )
+except PaymentRequiredError as exc:
+    # Parses PAYMENT-REQUIRED (x402 v2), X-Stacks-Payment-Required (sBTC), and WWW-Authenticate (L402)
+    print("402 protocols:", exc.challenge["protocols"])
+    print("x402 header present:", bool(exc.challenge["payment_required"]))
+    print("sBTC header present:", bool(exc.challenge["stacks_payment_required"]))
+
+# Blind Homomorphic OLAP (POST /api/v1/blind/query) & read-only SQL (POST /api/v1/query)
+# olap = core.query_blind(table="private_ledger", op="SUM", column="amount")
+# rows = core.query_json("SELECT 1")
 
 # Power-of-2 length-hiding PAD2 framing
 padded = pad2(b"confidential payload", min_block=256)

@@ -24,7 +24,9 @@ export interface PaymentChallenge {
   status: 402;
   protocols: Array<"x402" | "L402" | "sBTC">;
   wwwAuthenticate: string;
+  paymentRequired: string;
   xPaymentRequired: string;
+  stacksPaymentRequired: string;
   body: unknown;
 }
 
@@ -103,6 +105,12 @@ export class BlindCoreClient {
     path: string,
     options?: { method?: string; body?: unknown; headers?: Record<string, string> }
   ): Promise<T>;
+  health<T = unknown>(): Promise<T>;
+  pricing<T = unknown>(): Promise<T>;
+  queryJson<T = unknown>(sql: string): Promise<T>;
+  queryBlindJsonb<T = unknown>(payload: Record<string, unknown>): Promise<T>;
+  ingestBlindJsonb<T = unknown>(payload: Record<string, unknown>): Promise<T>;
+  queryBlind<T = unknown>(payload: Record<string, unknown>): Promise<T>;
   queryJsonb<T = unknown>(
     collection: string,
     filter?: Record<string, unknown>,

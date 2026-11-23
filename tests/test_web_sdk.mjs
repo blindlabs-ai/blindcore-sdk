@@ -11,7 +11,14 @@ import {
 function makeMockFetch(handler) {
   const calls = [];
   const fn = async (url, init = {}) => {
-    const body = init.body ? JSON.parse(init.body) : undefined;
+    let body = undefined;
+    if (init.body !== undefined) {
+      try {
+        body = JSON.parse(init.body);
+      } catch {
+        body = init.body;
+      }
+    }
     calls.push({ url, method: init.method || "GET", headers: init.headers || {}, body });
     const res = await handler(url, init, calls.length);
     const status = res.status ?? 200;
@@ -123,7 +130,6 @@ async function runTests() {
 
     let seenProtocols = [];
     const core = new BlindCoreClient({
-      baseUrl: "https://api.blindcore.io",
       token: "demo-tok",
       fetchImpl: mockFetch,
       onPaymentRequired: async (challenge) => {
@@ -131,21 +137,68 @@ async function runTests() {
         return { "X-PAYMENT": "proof-xyz" };
       }
     });
+    assert.equal(core.baseUrl, "https://api.blindlabs.ai");
 
     const res = await core.queryJsonb("events", { type: "click" });
     assert.deepEqual(res, { rows: [{ id: 1 }] });
     assert.deepEqual(seenProtocols, ["x402", "L402", "sBTC"]);
     assert.equal(mockFetch.calls.length, 2);
-    assert.equal(mockFetch.calls[0].url, "https://api.blindcore.io/v1/jsonb/query");
+    assert.equal(mockFetch.calls[0].url, "https://api.blindlabs.ai/v1/jsonb/query");
 
-    // Without hook, 402 throws PaymentRequiredError
-    const noHookFetch = makeMockFetch(() => ({
+    // Without hook, 402 throws PaymentRequiredError & parses PAYMENT-REQUIRED + X-Stacks-Payment-Required
+    // while NOT reporting L402 when extensions.lightning_l402.enabled is false
+    const live402Fetch = makeMockFetch(() => ({
       status: 402,
-      headers: { "X-Payment-Required": "x402-v2" },
-      body: { x402Version: 2 }
+      headers: {
+        "PAYMENT-REQUIRED": "eyJ4NDAyVmVyc2lvbiI6Mn0=",
+        "X-Stacks-Payment-Required": "eyJuZXR3b3JrIjoic3RhY2tzOm1haW5uZXQifQ=="
+      },
+      body: {
+        x402Version: 2,
+        extensions: {
+          lightning_l402: { enabled: false, invoice: "", macaroon: "", paymentHash: "", sats: 2 },
+          stacks_sbtc: { network: "stacks:mainnet", amountSats: 2 }
+        }
+      }
     }));
-    const coreNoHook = new BlindCoreClient({ baseUrl: "https://api.blindcore.io", fetchImpl: noHookFetch });
-    await assert.rejects(() => coreNoHook.sklearnMnb({ x: [[1, 2]] }), PaymentRequiredError);
+    const coreNoHook = new BlindCoreClient({ fetchImpl: live402Fetch });
+    let caughtErr = null;
+    try {
+      await coreNoHook.queryBlindJsonb({ table: "t", op: "CONTAINS" });
+    } catch (err) {
+      caughtErr = err;
+    }
+    assert.ok(caughtErr instanceof PaymentRequiredError);
+    assert.deepEqual(caughtErr.challenge.protocols, ["x402", "sBTC"]);
+    assert.equal(caughtErr.challenge.paymentRequired, "eyJ4NDAyVmVyc2lvbiI6Mn0=");
+    assert.equal(caughtErr.challenge.xPaymentRequired, "eyJ4NDAyVmVyc2lvbiI6Mn0=");
+    assert.equal(caughtErr.challenge.stacksPaymentRequired, "eyJuZXR3b3JrIjoic3RhY2tzOm1haW5uZXQifQ==");
+    assert.equal(live402Fetch.calls[0].url, "https://api.blindlabs.ai/api/v1/blind/jsonb/query");
+
+    // Live /api/v1/query?format=json helper with PAYMENT-SIGNATURE retry
+    const sqlFetch = makeMockFetch((url, init, attempt) => {
+      if (attempt === 1) {
+        return {
+          status: 402,
+          headers: { "PAYMENT-REQUIRED": "eyJ4NDAyVmVyc2lvbiI6Mn0=" },
+          body: { x402Version: 2, extensions: { lightning_l402: { enabled: true } } }
+        };
+      }
+      assert.equal(init.headers["PAYMENT-SIGNATURE"], "x402-sig-ok");
+      return { status: 200, body: { rows: [[1]] } };
+    });
+    let sqlProtocols = [];
+    const coreSql = new BlindCoreClient({
+      fetchImpl: sqlFetch,
+      onPaymentRequired: async (ch) => {
+        sqlProtocols = ch.protocols;
+        return { "PAYMENT-SIGNATURE": "x402-sig-ok" };
+      }
+    });
+    const sqlRes = await coreSql.queryJson("SELECT 1");
+    assert.deepEqual(sqlRes, { rows: [[1]] });
+    assert.deepEqual(sqlProtocols, ["x402", "L402"]);
+    assert.equal(sqlFetch.calls[0].url, "https://api.blindlabs.ai/api/v1/query?format=json");
   }
 
   // 7. BlindSignClient, BlindFeedClient, BlindMailClient request construction
@@ -155,7 +208,7 @@ async function runTests() {
       if (url.endsWith("/v1/vault/shares")) return { status: 201, body: { share_id: "sh_77" } };
       return { status: 200, body: { ok: true } };
     });
-    const core = new BlindCoreClient({ baseUrl: "https://api.blindcore.io", fetchImpl: mockFetch });
+    const core = new BlindCoreClient({ fetchImpl: mockFetch });
     const sign = new BlindSignClient(core);
     const feed = new BlindFeedClient(core);
     const mail = new BlindMailClient(core);
@@ -169,7 +222,7 @@ async function runTests() {
       signingPrivateKey: kp.privateKey
     });
     assert.equal(envRes.envelopeId, "env_99");
-    assert.match(envRes.inviteLink, /^https:\/\/sign\.blindcore\.io\/#env=env_99&k=[A-Za-z0-9_-]+$/);
+    assert.match(envRes.inviteLink, /^https:\/\/blindlabs\.ai\/sign\/#env=env_99&k=[A-Za-z0-9_-]+$/);
 
     await sign.countersignEnvelope({
       envelopeId: "env_99",
@@ -180,7 +233,7 @@ async function runTests() {
     await sign.shredEnvelope("env_99");
     await sign.storeVaultItem({ itemBytes: "secret-key", label: "backup" });
     const shareRes = await sign.createTempShare({ itemId: "item_1", keyBase64Url: envRes.keyBase64Url });
-    assert.match(shareRes.shareLink, /#share=sh_77&k=/);
+    assert.match(shareRes.shareLink, /^https:\/\/blindlabs\.ai\/sign\/#share=sh_77&k=/);
 
     const aliceEcdh = await BlindCrypto.generateEcdhKeyPair();
     const bobEcdh = await BlindCrypto.generateEcdhKeyPair();

@@ -1130,6 +1130,18 @@ class TriRailEngine:
             data = json.loads(resp.read().decode("utf-8"))
         return str(data["payment_hash"]).lower(), str(data["payment_request"])
 
+    def _allow_synthetic_test_l402(self) -> bool:
+        if not self.config.test_mode:
+            return False
+        pub_host = (urllib.parse.urlsplit(self.config.public_base_url).hostname or "").lower()
+        if (
+            self.config.base_network == BASE_MAINNET_CAIP2
+            and self.config.stacks_network == "mainnet"
+            and (self.config.trust_proxy_headers or pub_host in ("api.blindlabs.ai", "blindlabs.ai"))
+        ):
+            return False
+        return True
+
     def mint_l402_challenge(self, tier: PriceTier, path: str, sats_override: int | None = None) -> dict[str, Any]:
         sats = sats_override if sats_override is not None else tier.sats
         token_id = secrets.token_hex(16)
@@ -1139,7 +1151,7 @@ class TriRailEngine:
             payment_hash, bolt11 = self._mint_lnd_invoice(sats, memo)
         elif self.config.lnbits_url and self.config.lnbits_api_key:
             payment_hash, bolt11 = self._mint_lnbits_invoice(sats, memo)
-        elif self.config.test_mode:
+        elif self._allow_synthetic_test_l402():
             preimage_hex = self.derive_test_preimage_hex(token_id)
             payment_hash = hashlib.sha256(bytes.fromhex(preimage_hex)).hexdigest()
             bolt11 = f"lnbc{sats}n1blindcoretest{payment_hash[:28]}"
@@ -2030,15 +2042,93 @@ class TriRailRequestHandler(BaseHTTPRequestHandler):
                 return xff[:64]
         return self.client_address[0] if self.client_address else "unknown"
 
+    CORS_ALLOW_METHODS = "GET, POST, PUT, DELETE, OPTIONS, HEAD"
+    CORS_ALLOW_HEADERS = (
+        "Authorization, Content-Type, PAYMENT-SIGNATURE, X-PAYMENT, "
+        "X-Stacks-Payment-Tx, X-BlindCore-Session, X-BlindCore-Api-Key, "
+        "X-Mailbox-Addr, X-Mailbox-Pub, X-Mailbox-Ts, X-Mailbox-Body-Sha256, "
+        "X-Mailbox-Nonce, X-Mailbox-Sig"
+    )
+    CORS_EXPOSE_HEADERS = (
+        "PAYMENT-REQUIRED, PAYMENT-RESPONSE, X-PAYMENT-RESPONSE, "
+        "X-Stacks-Payment-Required, WWW-Authenticate, "
+        "X-RateLimit-Remaining-Min, X-RateLimit-Remaining-Day, Retry-After"
+    )
+
     def _send_bytes(self, status: int, body: bytes, headers: dict[str, str]) -> None:
         self.send_response(status)
         out_headers = dict(headers)
         out_headers["Content-Length"] = str(len(body))
         out_headers.setdefault("Connection", "close")
+        out_headers.setdefault("Access-Control-Allow-Origin", "*")
+        out_headers.setdefault("Access-Control-Expose-Headers", self.CORS_EXPOSE_HEADERS)
         for k, v in out_headers.items():
             self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD" and body:
+            self.wfile.write(body)
+
+    def do_OPTIONS(self) -> None:
+        client_ip = self._client_ip()
+        if not self.engine.rate_limiter.allow_request(client_ip):
+            self._send_json(429, {"error": "rate limit or payment failure lockout"})
+            return
+        try:
+            validate_request_path(self.path, allow_proxy_only=False)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        self._send_bytes(
+            204,
+            b"",
+            {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": self.CORS_ALLOW_METHODS,
+                "Access-Control-Allow-Headers": self.CORS_ALLOW_HEADERS,
+                "Access-Control-Expose-Headers": self.CORS_EXPOSE_HEADERS,
+                "Access-Control-Max-Age": "86400",
+            },
+        )
+
+    def do_HEAD(self) -> None:
+        client_ip = self._client_ip()
+        if not self.engine.rate_limiter.allow_request(client_ip):
+            self._send_json(429, {"error": "rate limit or payment failure lockout"})
+            return
+        try:
+            clean_path = validate_request_path(self.path, allow_proxy_only=False)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+
+        if clean_path in ("/health", "/healthz"):
+            self._send_json(
+                200,
+                {
+                    "status": "ok",
+                    "service": "blindcore-trirail-gate",
+                    "x402Version": 2,
+                    "rails": ["base-x402", "ln-l402", "stacks-sbtc"],
+                    "baseNetwork": self.engine.config.base_network,
+                    "stacksNetwork": self.engine.config.stacks_network,
+                    "upstreamConfigured": bool(self.engine.config.upstream_url),
+                },
+            )
+            return
+        if clean_path == "/api/v1/pricing":
+            self._send_json(200, self.engine.build_pricing_payload())
+            return
+        if clean_path == "/llms.txt":
+            body = self.engine.build_llms_txt().encode("utf-8")
+            self._send_bytes(200, body, {"Content-Type": "text/plain; charset=utf-8"})
+            return
+        if clean_path == "/.well-known/x402.json":
+            self._send_json(200, self.engine.build_well_known_x402())
+            return
+        if clean_path == "/.well-known/agent-card.json":
+            self._send_json(200, self.engine.build_agent_card())
+            return
+        self._send_json(404, {"error": "not found"})
 
     def _send_json(self, status: int, obj: Any, extra_headers: dict[str, str] | None = None) -> None:
         body = json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("utf-8")
