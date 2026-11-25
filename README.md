@@ -19,7 +19,7 @@ Official zero-dependency Python 3 and JavaScript/TypeScript (ESM) client SDK, Mo
 - **End-to-End Client Envelope Security:** Built-in `AES-256-GCM` encryption with `PAD2` power-of-2 length-hiding padding, `ECDSA P-256` detached document and post signatures, and `ECDH P-256` shared-key derivation for encrypted direct messages and group key rotation.
 - **Full BlindCore Surface in One Kit:** Unified `BlindCoreClient` (SQL, Blind Homomorphic OLAP, BlindJSONB Encrypted NoSQL, encrypted `SKLEARN_MNB` scoring, NDJSON streaming, RFC 6455 live WebSockets), `BlindSignClient`, `BlindFeedClient`, and `BlindMailClient`.
 - **Native AI Agent & Tri-Rail `HTTP 402` Monetization:** Ships a zero-dependency JSON-RPC 2.0 `MCP` stdio server (`mcp/mcp_server.py`), a Coinbase AgentKit provider (`mcp/agentkit_provider.py`), a reference Tri-Rail `HTTP 402` gateway (`gate/blindcore_trirail_gate.py`), and a zero-dependency Cloudflare Worker `x402 v2` edge proxy (`cloudflare-worker-x402/`).
-- **Verifiable State-Root Anchoring & Reproducible Benchmarks:** Includes Base L2 Solidity (`BlindCoreRootAnchor.sol`) and Stacks Clarity (`blindcore-root-anchor.clar`) state-root anchors, `4` standalone Mode 2 confidential compute sample apps (`apps/`), and `10` reproducible Jupyter notebooks (`notebooks/`), including the [4-Pillar Encrypted Storage, Query, ML & Client-Side Zero-Knowledge Benchmark](notebooks/10_encrypted_storage_compression_benchmark.ipynb).
+- **Verifiable State-Root Anchoring & Reproducible Benchmarks:** Includes Base L2 Solidity (`BlindCoreRootAnchor.sol`) and Stacks Clarity (`blindcore-root-anchor.clar`) state-root anchors, `4` standalone Mode 2 confidential compute sample apps (`apps/`), a full zero-key encrypted `scikit-learn` estimator suite (`sklearn_blind/`, `23` estimators across `8` families with `11.99x` live radix-packed `BlindMultinomialNB` E2E speedup), and `11` reproducible Jupyter notebooks (`notebooks/`), including the [4-Pillar Encrypted Storage, Query, ML & Client-Side Zero-Knowledge Benchmark](notebooks/10_encrypted_storage_compression_benchmark.ipynb) and the [Encrypted `scikit-learn` Suite Benchmark](notebooks/11_encrypted_sklearn_suite_benchmark.ipynb).
 
 ---
 
@@ -158,6 +158,7 @@ python3 eval_blindcore.py --help
 
 ```text
 python/blindcore_sdk.py           # Zero-dep Python 3 SDK (SQL, Blind OLAP/JSONB, WS, Sign, Feed, Mail)
+sklearn_blind/                    # Encrypted scikit-learn suite (23 estimators across 8 families, radix-B packing)
 js/blindcore-web.js               # Zero-dep ES2020 WebCrypto + Fetch SDK (Browser, Workers, Node 22+)
 js/blindcore-web.d.ts             # TypeScript type definitions for blindcore-web.js
 mcp/mcp_server.py                 # Zero-dep JSON-RPC 2.0 Model Context Protocol (MCP) stdio server
@@ -168,13 +169,13 @@ gate/test_trirail_redteam_fuzz.py # Deterministic 12,221-probe red-team & replay
 apps/app01..app04_*.py            # Confidential compute sample apps (Brain, Darkpool, Fraud, Nostr)
 examples/01..03_*.py              # Base x402, Lightning L402, and Stacks sBTC end-to-end flows
 examples/custom-frontend.html     # Single-file zero-knowledge browser starter
-notebooks/01..10_*.ipynb          # Reproducible notebooks (HIPAA, Fraud, Defense, Blind OLAP/JSONB, 4-Pillar Benchmark)
+notebooks/01..11_*.ipynb          # Reproducible notebooks (HIPAA, Fraud, Defense, Blind OLAP/JSONB, 4-Pillar & sklearn Suite)
 cloudflare-worker-x402/           # Zero-dep Cloudflare Worker x402 v2 edge scoring proxy
 contracts/base/                   # Base L2 Solidity state-root anchor (BlindCoreRootAnchor.sol)
 contracts/stacks/                 # Stacks Clarity state-root anchor (blindcore-root-anchor.clar)
 tools/ui_self_test.py             # Headless UI contract & security self-test harness
 eval_blindcore.py                 # Live BlindCore endpoint parity & latency evaluation harness
-tests/                            # Python SDK, Web ESM SDK, and UI self-test suites
+tests/                            # Python SDK, encrypted sklearn, live ZK audit, Web ESM SDK, and UI test suites
 LICENSE                           # Apache License, Version 2.0
 NOTICE                            # Attribution, trademark reservation, and server-side scope notice
 ```
@@ -187,6 +188,8 @@ Run the complete local verification suite with zero network calls and zero bytec
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_sdk.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_live_zero_knowledge_audit.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_sklearn_blind.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_ui_self_test.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest apps/test_apps_1_2.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest gate/test_trirail_gate.py

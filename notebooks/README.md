@@ -29,7 +29,9 @@ Measured live against local `blindcore-api` with 100% raw HTTP wire capture (`0`
 | 08 | `08_consortium_fraud_credit.ipynb` | Consortium Fraud & Credit (App 03 + Blind OLAP) | 200 rows | `40.26 ms` / `4.05 ms` / `10.6 KB` | `267.58 ms` / `23.74 ms` / `25.53 ms` (`21.34 ms`) / `9.23 ms` / `204.2 KB` | `7.9774` | `0.00e+00`, `0` leaks / `342,999 B`, PASS |
 | 09 | `09_nostr_blind_relay.ipynb` | Decentralized Nostr Blind Relay (App 04 + BlindJSONB) | 160 docs | `46.32 ms` / `3.30 ms` / `9.8 KB` | `188.56 ms` / `18.21 ms` / `11.46 ms` (`8.04 ms`) / `3.16 ms` / `260.4 KB` | `7.9813` | `0.00e+00`, `0` leaks / `304,320 B`, PASS |
 
-See also `10_encrypted_storage_compression_benchmark.ipynb` for the 4-pillar encrypted storage & compression benchmark suite.
+See also:
+- `10_encrypted_storage_compression_benchmark.ipynb`: 4-pillar encrypted storage, SQL, ML, and Mode 2 client-side zero-knowledge compute benchmark suite.
+- `11_encrypted_sklearn_suite_benchmark.ipynb`: Full encrypted `scikit-learn` (`sklearn_blind/`) benchmark across all `8` estimator families (`23/23` live estimators PASS vs. stock `scikit-learn 1.8.0`), live radix-packed `BlindMultinomialNB` speedup (`11.99x` E2E: `4,202.90 ms` unpacked baseline vs. `350.44 ms` packed, `Max |dP| = 5.37e-06`, `100.0%` argmax match), and hostile MITM wire audit (`185,565 B` over `11` requests, `0` leaks, `7.9782 bits/B`, `NSAU0001` + 1-bit tamper + wrong-key knockouts PASS).
 
 ## Running Locally
 

@@ -15,25 +15,33 @@ Covers:
 
 from __future__ import annotations
 
+import atexit
 import base64
 import hashlib
 import hmac
 import http.client
 import json
+import multiprocessing
 import os
 import secrets
 import socket
 import ssl
 import struct
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Callable, Dict, Iterator, List, Optional, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Union
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _CRYPTO_AESGCM
 except Exception:  # pragma: no cover - optional acceleration; pure-stdlib fallback included
     _CRYPTO_AESGCM = None
+
+try:
+    import numpy as _np
+except Exception:  # pragma: no cover - optional acceleration; pure-stdlib fallback included
+    _np = None
 
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_FRAME_BYTES = 67108864
@@ -319,6 +327,7 @@ class BlindCoreClient:
             Callable[[Dict[str, Any], Dict[str, Any]], Optional[Dict[str, str]]]
         ] = None,
         ssl_context: Optional[ssl.SSLContext] = None,
+        keep_alive: bool = True,
     ) -> None:
         if token is not None:
             if not isinstance(token, str) or not _is_valid_token(token):
@@ -338,6 +347,29 @@ class BlindCoreClient:
         self._timeout = self.timeout
         self.on_payment_required = on_payment_required
         self._ssl_context = ssl_context
+        self._keep_alive = bool(keep_alive)
+        self._conn_local = threading.local()
+        self._open_conns_lock = threading.Lock()
+        self._open_conns: list[http.client.HTTPConnection] = []
+
+    def close(self) -> None:
+        """Close any cached keep-alive HTTP connections opened by this client."""
+        with self._open_conns_lock:
+            conns = list(self._open_conns)
+            self._open_conns.clear()
+        for conn in conns:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if hasattr(self._conn_local, "conn"):
+            self._conn_local.conn = None
+
+    def __enter__(self) -> "BlindCoreClient":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
 
     def request(
         self,
@@ -482,15 +514,64 @@ class BlindCoreClient:
                 if not isinstance(k, str) or not isinstance(v, str) or _has_ctl(k) or _has_ctl(v):
                     raise ValueError("extra_headers keys and values must be strings without control characters")
                 hdrs[k] = v
-        conn = self._open_conn()
+        if not self._keep_alive:
+            conn = self._open_conn()
+            try:
+                conn.request(method, path, body=body, headers=hdrs)
+                resp = conn.getresponse()
+                resp_hdrs = {k.lower(): v for k, v in resp.getheaders()}
+                data = self._read_bounded_body(resp)
+                return resp.status, resp_hdrs, data
+            finally:
+                conn.close()
+
+        hdrs.setdefault("Connection", "keep-alive")
+        for attempt in range(2):
+            conn = getattr(self._conn_local, "conn", None)
+            reused = conn is not None
+            if conn is None:
+                conn = self._open_conn()
+                self._conn_local.conn = conn
+                with self._open_conns_lock:
+                    self._open_conns.append(conn)
+            try:
+                conn.request(method, path, body=body, headers=hdrs)
+                resp = conn.getresponse()
+                resp_hdrs = {k.lower(): v for k, v in resp.getheaders()}
+                data = self._read_bounded_body(resp)
+                if resp.will_close or resp_hdrs.get("connection", "").lower() == "close":
+                    self._discard_thread_conn(conn)
+                return resp.status, resp_hdrs, data
+            except (
+                http.client.RemoteDisconnected,
+                http.client.BadStatusLine,
+                http.client.CannotSendRequest,
+                http.client.ResponseNotReady,
+                BrokenPipeError,
+                ConnectionResetError,
+                EOFError,
+            ):
+                self._discard_thread_conn(conn)
+                if reused and attempt == 0:
+                    continue
+                raise
+            except Exception:
+                self._discard_thread_conn(conn)
+                raise
+        raise RuntimeError("unreachable HTTP request state")
+
+    def _discard_thread_conn(self, conn: http.client.HTTPConnection) -> None:
+        if getattr(self._conn_local, "conn", None) is conn:
+            self._conn_local.conn = None
         try:
-            conn.request(method, path, body=body, headers=hdrs)
-            resp = conn.getresponse()
-            resp_hdrs = {k.lower(): v for k, v in resp.getheaders()}
-            data = self._read_bounded_body(resp)
-            return resp.status, resp_hdrs, data
-        finally:
             conn.close()
+        except Exception:
+            pass
+        with self._open_conns_lock:
+            try:
+                self._open_conns.remove(conn)
+            except ValueError:
+                pass
 
     def _request_bytes_with_402(
         self,
@@ -1350,15 +1431,159 @@ _CRC32C_TABLE: tuple[int, ...] = tuple(
     (lambda c: [c := ((c >> 1) ^ 0x82F63B78 if (c & 1) else (c >> 1)) for _ in range(8)][-1])(i)
     for i in range(256)
 )
+_CRC32C_NP_CACHE: Any = None
+_PLWE_POOL_LOCK = threading.Lock()
+_PLWE_POOL: Any = None
+_PLWE_POOL_WORKERS: int = 0
+_WORKER_PLWE_KEYS: dict[bytes, "BlindClientPlweKey"] = {}
+
+
+def _crc32c_pure(data: bytes | memoryview, init_crc: int = 0xFFFFFFFF) -> int:
+    crc = init_crc
+    tbl = _CRC32C_TABLE
+    for byte in data:
+        crc = tbl[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    return crc
+
+
+def _gf2_mat_vec(mat: list[int], vec: int) -> int:
+    out = 0
+    row_i = 0
+    while vec:
+        if vec & 1:
+            out ^= mat[row_i]
+        vec >>= 1
+        row_i += 1
+    return out
+
+
+def _gf2_mat_sq(mat: list[int]) -> list[int]:
+    return [_gf2_mat_vec(mat, col) for col in mat]
+
+
+def _get_crc32c_np_tables() -> Any:
+    global _CRC32C_NP_CACHE
+    if _CRC32C_NP_CACHE is not None:
+        return _CRC32C_NP_CACHE
+    tbl_np = _np.array(_CRC32C_TABLE, dtype=_np.uint32)
+    # Linear operator L_1 for advancing CRC-32C by 1 zero byte in reflected form.
+    tbl = _CRC32C_TABLE
+    mat = [tbl[(1 << bit) & 0xFF] ^ ((1 << bit) >> 8) for bit in range(32)]
+    # Square 4 times to obtain L_16 (16-byte lane stride).
+    for _ in range(4):
+        mat = _gf2_mat_sq(mat)
+    stride_tables: list[tuple[Any, Any, Any, Any]] = []
+    cur = mat
+    for _ in range(16):  # Strides from 16 B up to 512 KiB
+        t0 = _np.array([_gf2_mat_vec(cur, b) for b in range(256)], dtype=_np.uint32)
+        t1 = _np.array([_gf2_mat_vec(cur, b << 8) for b in range(256)], dtype=_np.uint32)
+        t2 = _np.array([_gf2_mat_vec(cur, b << 16) for b in range(256)], dtype=_np.uint32)
+        t3 = _np.array([_gf2_mat_vec(cur, b << 24) for b in range(256)], dtype=_np.uint32)
+        stride_tables.append((t0, t1, t2, t3))
+        cur = _gf2_mat_sq(cur)
+    _CRC32C_NP_CACHE = (tbl_np, stride_tables)
+    return _CRC32C_NP_CACHE
 
 
 def crc32c(data: bytes) -> int:
     """Compute Castagnoli CRC-32C (polynomial 0x82F63B78)."""
+    if _np is None or len(data) < 256:
+        return _crc32c_pure(data) ^ 0xFFFFFFFF
+    tbl_np, stride_tables = _get_crc32c_np_tables()
     crc = 0xFFFFFFFF
-    tbl = _CRC32C_TABLE
-    for byte in data:
-        crc = tbl[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    pos = 0
+    total = len(data)
+    u32_8 = _np.uint32(8)
+    u32_16 = _np.uint32(16)
+    u32_24 = _np.uint32(24)
+    u32_ff = _np.uint32(0xFF)
+    while total - pos >= 256:
+        k_pow = min(((total - pos) // 16).bit_length() - 1, len(stride_tables))
+        m = 1 << k_pow
+        span = m * 16
+        blocks = _np.frombuffer(data, dtype=_np.uint8, count=span, offset=pos).reshape(m, 16)
+        c = _np.zeros(m, dtype=_np.uint32)
+        c[0] = _np.uint32(crc)
+        for j in range(16):
+            c = tbl_np[(c ^ blocks[:, j]) & u32_ff] ^ (c >> u32_8)
+        for lvl in range(k_pow):
+            t0, t1, t2, t3 = stride_tables[lvl]
+            left = c[0::2]
+            right = c[1::2]
+            c = (
+                t0[left & u32_ff]
+                ^ t1[(left >> u32_8) & u32_ff]
+                ^ t2[(left >> u32_16) & u32_ff]
+                ^ t3[(left >> u32_24) & u32_ff]
+                ^ right
+            )
+        crc = int(c[0])
+        pos += span
+    if pos < total:
+        crc = _crc32c_pure(memoryview(data)[pos:], crc)
     return crc ^ 0xFFFFFFFF
+
+
+def _shutdown_plwe_pool() -> None:
+    global _PLWE_POOL, _PLWE_POOL_WORKERS
+    pool = _PLWE_POOL
+    _PLWE_POOL = None
+    _PLWE_POOL_WORKERS = 0
+    if pool is not None:
+        try:
+            pool.terminate()
+            pool.join()
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_plwe_pool)
+
+
+def _get_plwe_pool(workers: int) -> Any:
+    global _PLWE_POOL, _PLWE_POOL_WORKERS
+    with _PLWE_POOL_LOCK:
+        if _PLWE_POOL is not None and _PLWE_POOL_WORKERS == workers:
+            return _PLWE_POOL
+        if _PLWE_POOL is not None:
+            try:
+                _PLWE_POOL.terminate()
+                _PLWE_POOL.join()
+            except Exception:
+                pass
+            _PLWE_POOL = None
+            _PLWE_POOL_WORKERS = 0
+        try:
+            ctx = multiprocessing.get_context("forkserver")
+            _PLWE_POOL = ctx.Pool(processes=workers)
+            _PLWE_POOL_WORKERS = workers
+            return _PLWE_POOL
+        except Exception:
+            return None
+
+
+def _worker_get_plwe_key(seed: bytes) -> "BlindClientPlweKey":
+    key = _WORKER_PLWE_KEYS.get(seed)
+    if key is None:
+        if len(_WORKER_PLWE_KEYS) >= 16:
+            _WORKER_PLWE_KEYS.clear()
+        key = BlindClientPlweKey(seed)
+        _WORKER_PLWE_KEYS[seed] = key
+    return key
+
+
+def _worker_encrypt_chunk(args: tuple[bytes, list[int], bool]) -> list[Any]:
+    seed, vals, as_hex = args
+    key = _worker_get_plwe_key(seed)
+    if as_hex:
+        return [key.encrypt_int(v).hex() for v in vals]
+    return [key.encrypt_int(v) for v in vals]
+
+
+def _worker_decrypt_chunk(args: tuple[bytes, list[bytes | str]]) -> list[int]:
+    seed, frames = args
+    key = _worker_get_plwe_key(seed)
+    return [key.decrypt_int(fr) for fr in frames]
 
 
 def _coerce_frame_bytes(frame: bytes | bytearray | memoryview | str, label: str = "frame") -> bytes:
@@ -1476,6 +1701,12 @@ class BlindClientPlweKey:
         )
         self._pos_indices: tuple[int, ...] = tuple(i for i, s in enumerate(sk) if s == 1)
         self._neg_indices: tuple[int, ...] = tuple(i for i, s in enumerate(sk) if s == -1)
+        if _np is not None:
+            self._np_pos_idx: Any = _np.array(self._pos_indices, dtype=_np.intp)
+            self._np_neg_idx: Any = _np.array(self._neg_indices, dtype=_np.intp)
+        else:
+            self._np_pos_idx = None
+            self._np_neg_idx = None
 
     @classmethod
     def generate(cls) -> "BlindClientPlweKey":
@@ -1535,10 +1766,90 @@ class BlindClientPlweKey:
     def encrypt_int_hex(self, val: int) -> str:
         return self.encrypt_int(val).hex()
 
-    def decrypt_int(self, frame: bytes | bytearray | memoryview | str) -> int:
-        """Decrypt an 80-byte seeded or 16,464-byte expanded PLWE0001 frame locally."""
-        a, b = _unpack_plwe_components(frame)
-        dot = (sum(a[i] for i in self._pos_indices) - sum(a[i] for i in self._neg_indices)) % LWE_Q0
+    def _resolve_batch_workers(self, n_items: int, workers: int | None, min_parallel: int) -> int:
+        if workers is not None:
+            w = int(workers)
+            if w <= 1 or n_items < 2:
+                return 1
+            return min(w, n_items)
+        if n_items < min_parallel:
+            return 1
+        cpus = os.cpu_count() or 1
+        return max(1, min(8, cpus, n_items // 16))
+
+    def encrypt_batch(self, vals: Sequence[int], workers: int | None = None) -> list[bytes]:
+        """Encrypt a sequence of signed integers into fresh IND-CPA PLWE0001 frames."""
+        items = [int(v) for v in vals]
+        n = len(items)
+        if n == 0:
+            return []
+        w = self._resolve_batch_workers(n, workers, min_parallel=96)
+        if w > 1:
+            pool = _get_plwe_pool(w)
+            if pool is not None:
+                chunk_sz = (n + w - 1) // w
+                tasks = [
+                    (self._seed, items[i : i + chunk_sz], False)
+                    for i in range(0, n, chunk_sz)
+                ]
+                out: list[bytes] = []
+                for part in pool.map(_worker_encrypt_chunk, tasks):
+                    out.extend(part)
+                return out
+        return [self.encrypt_int(v) for v in items]
+
+    def encrypt_batch_hex(self, vals: Sequence[int], workers: int | None = None) -> list[str]:
+        """Encrypt a sequence of signed integers directly into hex PLWE0001 frames."""
+        items = [int(v) for v in vals]
+        n = len(items)
+        if n == 0:
+            return []
+        w = self._resolve_batch_workers(n, workers, min_parallel=96)
+        if w > 1:
+            pool = _get_plwe_pool(w)
+            if pool is not None:
+                chunk_sz = (n + w - 1) // w
+                tasks = [
+                    (self._seed, items[i : i + chunk_sz], True)
+                    for i in range(0, n, chunk_sz)
+                ]
+                out: list[str] = []
+                for part in pool.map(_worker_encrypt_chunk, tasks):
+                    out.extend(part)
+                return out
+        return [self.encrypt_int(v).hex() for v in items]
+
+    def decrypt_batch(
+        self,
+        frames: Sequence[bytes | bytearray | memoryview | str],
+        workers: int | None = None,
+    ) -> list[int]:
+        """Decrypt a sequence of PLWE0001 frames locally."""
+        items = list(frames)
+        n = len(items)
+        if n == 0:
+            return []
+        min_par = 128 if _np is not None else 32
+        w = self._resolve_batch_workers(n, workers, min_parallel=min_par)
+        if w > 1:
+            pool = _get_plwe_pool(w)
+            if pool is not None:
+                norm_items = [
+                    bytes(fr) if isinstance(fr, (bytearray, memoryview)) else fr
+                    for fr in items
+                ]
+                chunk_sz = (n + w - 1) // w
+                tasks = [
+                    (self._seed, norm_items[i : i + chunk_sz])
+                    for i in range(0, n, chunk_sz)
+                ]
+                out: list[int] = []
+                for part in pool.map(_worker_decrypt_chunk, tasks):
+                    out.extend(part)
+                return out
+        return [self.decrypt_int(fr) for fr in items]
+
+    def _decrypt_from_dot(self, dot: int, b: int) -> int:
         diff = (b - dot) % LWE_Q0
         if diff > LWE_Q0 // 2:
             rem = (LWE_Q0 - diff) % LWE_PLAIN_MOD
@@ -1546,6 +1857,52 @@ class BlindClientPlweKey:
         else:
             raw = diff % LWE_PLAIN_MOD
         return raw - LWE_PLAIN_MOD if raw > LWE_PLAIN_MOD // 2 else raw
+
+    def decrypt_int(self, frame: bytes | bytearray | memoryview | str) -> int:
+        """Decrypt an 80-byte seeded or 16,464-byte expanded PLWE0001 frame locally."""
+        if _np is not None and self._np_pos_idx is not None:
+            raw = _coerce_frame_bytes(frame, "PLWE0001 frame")
+            if len(raw) == PLWE_EXPANDED_BYTES and raw[:8] == PLWE_MAGIC:
+                ver, prof, n_val, k_val, t_mod, _sc, _qid, _sa, plen, stored_crc = struct.unpack(
+                    "<HBBIQQq16sII", raw[8:64]
+                )
+                if (
+                    ver == 1
+                    and prof == PLWE_PROFILE_D0
+                    and n_val == 1
+                    and k_val == 1
+                    and t_mod == LWE_PLAIN_MOD
+                    and plen == (LWE_DIM + 1) * 16
+                ):
+                    payload = raw[64:]
+                    if crc32c(raw[:60] + payload) != stored_crc:
+                        raise ValueError("PLWE0001 CRC-32C checksum mismatch")
+                    limbs = _np.frombuffer(payload, dtype="<u4").reshape(LWE_DIM + 1, 4)
+                    p = limbs[self._np_pos_idx].sum(axis=0, dtype=_np.uint64)
+                    n = limbs[self._np_neg_idx].sum(axis=0, dtype=_np.uint64)
+                    dot_pos = (
+                        int(p[0])
+                        + (int(p[1]) << 32)
+                        + (int(p[2]) << 64)
+                        + (int(p[3]) << 96)
+                    )
+                    dot_neg = (
+                        int(n[0])
+                        + (int(n[1]) << 32)
+                        + (int(n[2]) << 64)
+                        + (int(n[3]) << 96)
+                    )
+                    b_row = limbs[LWE_DIM]
+                    b = (
+                        int(b_row[0])
+                        + (int(b_row[1]) << 32)
+                        + (int(b_row[2]) << 64)
+                        + (int(b_row[3]) << 96)
+                    ) % LWE_Q0
+                    return self._decrypt_from_dot((dot_pos - dot_neg) % LWE_Q0, b)
+        a, b = _unpack_plwe_components(frame)
+        dot = (sum(a[i] for i in self._pos_indices) - sum(a[i] for i in self._neg_indices)) % LWE_Q0
+        return self._decrypt_from_dot(dot, b)
 
     @staticmethod
     def homomorphic_add(
