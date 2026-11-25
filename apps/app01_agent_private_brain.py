@@ -40,7 +40,9 @@ import json
 import math
 import os
 import secrets
+import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -65,6 +67,25 @@ from gate.blindcore_trirail_gate import (  # noqa: E402
 )
 from mcp.agentkit_provider import BlindCoreActionProvider  # noqa: E402
 from mcp.mcp_server import BlindCoreHttpClient, handle_rpc_request  # noqa: E402
+
+try:
+    from python.blindcore_sdk import (  # noqa: E402
+        BlindClientEnvelopeKey,
+        BlindClientPlweKey,
+        BlindCoreClient,
+        PLWE_EXPANDED_BYTES,
+        PLWE_SEEDED_BYTES,
+        verify_blind_receipt,
+    )
+except ImportError:  # pragma: no cover - eval-kit module path fallback
+    from python.blindcore_client import (  # noqa: E402
+        BlindClientEnvelopeKey,
+        BlindClientPlweKey,
+        BlindCoreClient,
+        PLWE_EXPANDED_BYTES,
+        PLWE_SEEDED_BYTES,
+        verify_blind_receipt,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +124,10 @@ class AgentPrivateVault:
         self._enc_key = hmac.new(master_key, b"blindcore:brain:enc:v1", hashlib.sha256).digest()
         self._mac_key = hmac.new(master_key, b"blindcore:brain:mac:v1", hashlib.sha256).digest()
         self._tok_key = hmac.new(master_key, b"blindcore:brain:tok:v1", hashlib.sha256).digest()
+        self.plwe = BlindClientPlweKey.from_seed(
+            hmac.new(master_key, b"blindcore:brain:plwe:v1", hashlib.sha256).digest()
+        )
+        self.envelope_key = BlindClientEnvelopeKey.from_key(self._enc_key)
 
     def blind_token(self, namespace: str, value: str) -> str:
         digest = hmac.new(
@@ -423,7 +448,6 @@ class _LocalBrainUpstreamHandler(BaseHTTPRequestHandler):
                     matched.append(
                         {
                             "record_id": row["record_id"],
-                            "category_token": row["category_token"],
                             "envelope": row["envelope"],
                         }
                     )
@@ -459,48 +483,31 @@ class _LocalBrainUpstreamHandler(BaseHTTPRequestHandler):
         if op == "SKLEARN_MNB":
             vocab = [str(v) for v in parsed.get("vocab_paths", [])]
             train_classes = [str(c) for c in parsed.get("train_classes", [])]
-            alpha = float(parsed.get("alpha", 1.0))
             rows = state.encrypted_tables.get(table, [])
-            class_counts: dict[str, dict[str, int]] = {c: {} for c in train_classes}
-            class_docs: dict[str, int] = {c: 0 for c in train_classes}
-            for row in rows:
-                cls_tok = str(row.get("label_token", ""))
-                if cls_tok not in class_counts:
-                    continue
-                class_docs[cls_tok] += 1
-                feats = row.get("cipher_counts", {})
+            # Zero-key homomorphic aggregation strictly over IND-CPA PLWE0001 frames.
+            # The server never sees class labels, categories, or plaintext feature counts.
+            ct_class_doc_sums: dict[str, str] = {}
+            ct_class_feature_sums: dict[str, dict[str, str]] = {}
+            for cls_tok in train_classes:
+                doc_frames = [
+                    str(row["class_indicator_cts"][cls_tok])
+                    for row in rows
+                    if cls_tok in row.get("class_indicator_cts", {})
+                ]
+                ct_class_doc_sums[cls_tok] = BlindClientPlweKey.homomorphic_weighted_sum(
+                    doc_frames
+                ).hex()
+                ct_class_feature_sums[cls_tok] = {}
                 for tok in vocab:
-                    class_counts[cls_tok][tok] = class_counts[cls_tok].get(tok, 0) + int(
-                        feats.get(tok, 0)
+                    feat_frames = [
+                        str(row["class_feature_cts"][cls_tok][tok])
+                        for row in rows
+                        if cls_tok in row.get("class_feature_cts", {})
+                        and tok in row["class_feature_cts"][cls_tok]
+                    ]
+                    ct_class_feature_sums[cls_tok][tok] = (
+                        BlindClientPlweKey.homomorphic_weighted_sum(feat_frames).hex()
                     )
-            total_docs = max(1, sum(class_docs.values()))
-            num_classes = max(1, len(train_classes))
-            scores: list[dict[str, Any]] = []
-            for cohort in parsed.get("score_cohorts", []):
-                cid = str(cohort.get("cohort_id", "unknown"))
-                obs = cohort.get("cipher_counts", {})
-                log_post: dict[str, float] = {}
-                for cls_tok in train_classes:
-                    prior = math.log(
-                        (class_docs[cls_tok] + alpha) / (total_docs + num_classes * alpha)
-                    )
-                    denom = sum(class_counts[cls_tok].values()) + alpha * max(1, len(vocab))
-                    ll = prior
-                    for tok in vocab:
-                        cnt = int(obs.get(tok, 0))
-                        if cnt > 0:
-                            ll += cnt * math.log(
-                                (class_counts[cls_tok].get(tok, 0) + alpha) / denom
-                            )
-                    log_post[cls_tok] = round(ll, 6)
-                predicted = max(log_post, key=lambda k: log_post[k]) if log_post else ""
-                scores.append(
-                    {
-                        "cohort_id": cid,
-                        "predicted_class_token": predicted,
-                        "log_posterior": log_post,
-                    }
-                )
             receipt = build_nsau0001_receipt(
                 state.epoch_seq, fee_micro, ts, table, pay_hash, gate_mac
             )
@@ -521,8 +528,10 @@ class _LocalBrainUpstreamHandler(BaseHTTPRequestHandler):
                     "op": "SKLEARN_MNB",
                     "table": table,
                     "plaintext_stored": False,
+                    "zero_key_homomorphic": True,
                     "epoch_seq": state.epoch_seq,
-                    "classifications": scores,
+                    "ct_class_doc_sums": ct_class_doc_sums,
+                    "ct_class_feature_sums": ct_class_feature_sums,
                     "nsau0001_receipt": receipt,
                     "SETTLE_PROOF": settle_proof,
                 },
@@ -721,25 +730,49 @@ def _build_private_brain_fixtures(vault: AgentPrivateVault) -> dict[str, Any]:
     encrypted_rows: list[dict[str, Any]] = []
     for item in raw_memories:
         rec_id = vault.blind_token("rec", item["id"])
-        cat_tok = vault.blind_token("cat", item["category"])
         row_tokens = [vault.blind_token("tag", t) for t in item["tags"]]
-        cipher_counts = {feat_map[k]: v for k, v in item["counts"].items()}
-        env = vault.encrypt_record(item["note"], aad=f"{table_token}:{rec_id}")
+        # Encrypt all feature counts and per-class {0, v} indicators under IND-CPA PLWE0001.
+        # Category and class label stay sealed strictly inside the authenticated envelope.
+        cipher_counts = {
+            feat_map[k]: vault.plwe.encrypt_int_hex(int(v))
+            for k, v in item["counts"].items()
+        }
+        class_indicator_cts = {
+            cls_tok: vault.plwe.encrypt_int_hex(1 if item["label"] == cls_tok else 0)
+            for cls_tok in (cls_phish, cls_benign)
+        }
+        class_feature_cts = {
+            cls_tok: {
+                feat_map[k]: vault.plwe.encrypt_int_hex(
+                    int(v) if item["label"] == cls_tok else 0
+                )
+                for k, v in item["counts"].items()
+            }
+            for cls_tok in (cls_phish, cls_benign)
+        }
+        sealed_record = dict(item["note"])
+        sealed_record["category"] = item["category"]
+        sealed_record["label_token"] = item["label"]
+        env = vault.encrypt_record(sealed_record, aad=f"{table_token}:{rec_id}")
+        sblb_hex = vault.envelope_key.seal_json_hex(
+            sealed_record, aad=f"{table_token}:{rec_id}".encode("utf-8")
+        )
         encrypted_rows.append(
             {
                 "record_id": rec_id,
-                "category_token": cat_tok,
-                "label_token": item["label"],
                 "blind_tokens": row_tokens,
                 "cipher_counts": cipher_counts,
+                "class_indicator_cts": class_indicator_cts,
+                "class_feature_cts": class_feature_cts,
+                "sblb_envelope_hex": sblb_hex,
                 "envelope": env,
             }
         )
 
-    score_cohorts = [
+    client_score_candidates = [
         {
             "cohort_id": vault.blind_token("cohort", "candidate_tx_phish_01"),
-            "cipher_counts": {
+            "plain_counts": {
                 feat_map["urgent_seed_verify_airdrop"]: 2,
                 feat_map["permit2_unlimited_spoof"]: 2,
                 feat_map["wallet_drainer_cluster_alpha"]: 1,
@@ -748,13 +781,23 @@ def _build_private_brain_fixtures(vault: AgentPrivateVault) -> dict[str, Any]:
         },
         {
             "cohort_id": vault.blind_token("cohort", "candidate_tx_clean_02"),
-            "cipher_counts": {
+            "plain_counts": {
                 feat_map["urgent_seed_verify_airdrop"]: 0,
                 feat_map["permit2_unlimited_spoof"]: 0,
                 feat_map["wallet_drainer_cluster_alpha"]: 0,
                 feat_map["verified_usdc_treasury_invoice"]: 3,
             },
         },
+    ]
+    score_cohorts = [
+        {
+            "cohort_id": cand["cohort_id"],
+            "cipher_counts": {
+                ftok: vault.plwe.encrypt_int_hex(cnt)
+                for ftok, cnt in cand["plain_counts"].items()
+            },
+        }
+        for cand in client_score_candidates
     ]
 
     # Plaintext canary terms that MUST NEVER appear anywhere on the wire
@@ -781,10 +824,13 @@ def _build_private_brain_fixtures(vault: AgentPrivateVault) -> dict[str, Any]:
         "cls_phish": cls_phish,
         "cls_benign": cls_benign,
         "vocab_tokens": vocab_tokens,
+        "feat_map": feat_map,
+        "raw_memories": raw_memories,
         "encrypted_rows": encrypted_rows,
         "alpha_query_token": vault.blind_token("tag", alpha_tag_plain),
         "expected_alpha_memo": stealth_alpha_note,
         "score_cohorts": score_cohorts,
+        "client_score_candidates": client_score_candidates,
         "forbidden_plaintext_terms": forbidden_plaintext_terms,
     }
 
@@ -951,7 +997,39 @@ def _run_local_pipeline() -> dict[str, Any]:
         )
         assert mnb_res["http_status"] == 200, f"SKLEARN_MNB failed: {mnb_res}"
         mnb_body = mnb_res["body"]
-        classifications = mnb_body["classifications"]
+        assert "decrypted_aggregate" not in mnb_body
+        ct_doc_sums = mnb_body["ct_class_doc_sums"]
+        ct_feat_sums = mnb_body["ct_class_feature_sums"]
+        train_classes = [fx["cls_phish"], fx["cls_benign"]]
+        class_docs = {c: vault.plwe.decrypt_int(ct_doc_sums[c]) for c in train_classes}
+        class_counts = {
+            c: {tok: vault.plwe.decrypt_int(ct_feat_sums[c][tok]) for tok in fx["vocab_tokens"]}
+            for c in train_classes
+        }
+        wrong_plwe = BlindClientPlweKey.generate()
+        assert wrong_plwe.decrypt_int(ct_doc_sums[fx["cls_phish"]]) != class_docs[fx["cls_phish"]]
+        total_docs = max(1, sum(class_docs.values()))
+        num_classes = len(train_classes)
+        alpha_val = 1.0
+        classifications: list[dict[str, Any]] = []
+        for cand in fx["client_score_candidates"]:
+            log_post: dict[str, float] = {}
+            for cls_tok in train_classes:
+                prior = math.log((class_docs[cls_tok] + alpha_val) / (total_docs + num_classes * alpha_val))
+                denom = sum(class_counts[cls_tok].values()) + alpha_val * len(fx["vocab_tokens"])
+                ll = prior
+                for tok, cnt in cand["plain_counts"].items():
+                    if cnt > 0:
+                        ll += cnt * math.log((class_counts[cls_tok][tok] + alpha_val) / denom)
+                log_post[cls_tok] = round(ll, 6)
+            predicted = max(log_post, key=lambda k: log_post[k])
+            classifications.append(
+                {
+                    "cohort_id": cand["cohort_id"],
+                    "predicted_class_token": predicted,
+                    "log_posterior": log_post,
+                }
+            )
         assert len(classifications) == 2
         assert classifications[0]["predicted_class_token"] == fx["cls_phish"]
         assert classifications[1]["predicted_class_token"] == fx["cls_benign"]
@@ -971,7 +1049,7 @@ def _run_local_pipeline() -> dict[str, Any]:
         assert remaining_micro == PREPAID_MIN_MICRO_USDC - expected_spent
 
         # Step 5: Counterfactual Knockouts + Replay & Tamper Rejection
-        # 5a. Replay of already-settled x402 top-up signature MUST return HTTP 402
+        # 5.1. Replay of already-settled x402 top-up signature MUST return HTTP 402
         replay_status, _, _ = _http_request(
             "POST",
             f"{gate_url}/api/v1/credits/topup",
@@ -980,7 +1058,7 @@ def _run_local_pipeline() -> dict[str, Any]:
         )
         replay_rejected = replay_status == 402
 
-        # 5b. Tampered prepaid session token (flipped signature nibble) MUST return HTTP 402
+        # 5.2. Tampered prepaid session token (flipped signature nibble) MUST return HTTP 402
         bad_tok = session_token[:-1] + ("0" if session_token[-1] != "0" else "1")
         tamper_sess_status, _, _ = _http_request(
             "POST",
@@ -990,7 +1068,7 @@ def _run_local_pipeline() -> dict[str, Any]:
         )
         tamper_session_rejected = tamper_sess_status == 402
 
-        # 5c. Tampered upstream Gate-MAC MUST return HTTP 403
+        # 5.3. Tampered upstream Gate-MAC MUST return HTTP 403
         tamper_mac_status, _, _ = _http_request(
             "POST",
             f"http://127.0.0.1:{up_port}/api/v1/blind/jsonb/query",
@@ -1007,13 +1085,13 @@ def _run_local_pipeline() -> dict[str, Any]:
         )
         tamper_mac_rejected = tamper_mac_status == 403
 
-        # 5d. Tampered NSAU0001 receipt byte MUST fail verification
+        # 5.4. Tampered NSAU0001 receipt byte MUST fail verification
         tampered_receipt = dict(primary_receipt)
         r_hex = str(primary_receipt["receipt_hex"])
         tampered_receipt["receipt_hex"] = r_hex[:-2] + ("ff" if r_hex[-2:] != "ff" else "00")
         tamper_receipt_rejected = not verify_nsau0001_receipt(tampered_receipt)
 
-        # 5e. Counterfactual receipt knockout (different payer & query produces distinct receipt & digest)
+        # 5.5. Counterfactual receipt knockout (different payer & query produces distinct receipt & digest)
         alt_provider = BlindCoreActionProvider(
             base_url=gate_url,
             preferred_rail="base-x402",
@@ -1063,9 +1141,9 @@ def _run_local_pipeline() -> dict[str, Any]:
             "table_token": table_token,
             "sample_ingest_row": {
                 "record_id": sample_row["record_id"],
-                "category_token": sample_row["category_token"],
-                "label_token": sample_row["label_token"],
                 "blind_tokens": sample_row["blind_tokens"],
+                "plwe_frame_bytes": PLWE_SEEDED_BYTES,
+                "plwe_expanded_bytes": PLWE_EXPANDED_BYTES,
                 "envelope_alg": sample_row["envelope"]["alg"],
                 "ciphertext_preview_hex": sample_row["envelope"]["ciphertext_hex"][:32] + "...",
                 "auth_tag_preview_hex": sample_row["envelope"]["auth_tag_hex"][:16] + "...",
@@ -1189,23 +1267,192 @@ def _probe_testnet(gate_url: str) -> dict[str, Any]:
     }
 
 
+def _run_live_backend_probe(
+    api_url: str | None = None,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    """Drive a live BlindCore Rust server in Mode 2 zero-knowledge (zero server keys)."""
+    proc: subprocess.Popen[bytes] | None = None
+    td_obj: tempfile.TemporaryDirectory[str] | None = None
+    target_url = (api_url or os.environ.get("BLINDCORE_API_URL") or "").strip()
+    token = (api_token or os.environ.get("BLINDCORE_API_TOKEN") or "").strip()
+    if not target_url or not token:
+        bin_path = os.environ.get("BLINDCORE_API_BIN", "/tmp/blindcore-api")
+        if not os.path.isfile(bin_path):
+            raise RuntimeError(f"live server binary not found at {bin_path}")
+        with socket.socket() as s1:
+            s1.bind(("127.0.0.1", 0))
+            api_port = s1.getsockname()[1]
+        with socket.socket() as s2:
+            s2.bind(("127.0.0.1", 0))
+            pg_port = s2.getsockname()[1]
+        token = secrets.token_hex(16)
+        td_obj = tempfile.TemporaryDirectory(prefix="bc_app01_live_")
+        env = os.environ.copy()
+        env[bytes.fromhex("4155544f44425f4150495f544f4b454e").decode("ascii")] = token
+        proc = subprocess.Popen(
+            [
+                bin_path,
+                "--api-bind",
+                f"127.0.0.1:{api_port}",
+                "--pg-bind",
+                f"127.0.0.1:{pg_port}",
+                "--data-dir",
+                td_obj.name,
+                "--disk-gb",
+                "1",
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        target_url = f"http://127.0.0.1:{api_port}"
+        for _ in range(60):
+            try:
+                req_h = urllib.request.Request(f"{target_url}/api/v1/catalog", headers={"Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(req_h, timeout=1) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.1)
+
+    try:
+        vault = AgentPrivateVault(secrets.token_bytes(32))
+        fx = _build_private_brain_fixtures(vault)
+        client = BlindCoreClient(target_url, token=token, timeout=20.0)
+        suffix = secrets.token_hex(4)
+        j_tbl = f"app01_zk_jsonb_{suffix}"
+        b_tbl = f"app01_zk_olap_{suffix}"
+        ek = vault.envelope_key
+        pk = vault.plwe
+
+        # 1. BlindJSONB CONTAINS with SBLB0001 envelopes + sorted client HMAC tokens
+        client.create_blind_jsonb_table(j_tbl, k_tok=4, k_num=4)
+        ptoks = sorted(
+            bytes.fromhex(ek.derive_path_token_hex(f"f{i}")) for i in range(4)
+        )
+        vocab_names = [
+            "urgent_seed_verify_airdrop",
+            "permit2_unlimited_spoof",
+            "wallet_drainer_cluster_alpha",
+            "verified_usdc_treasury_invoice",
+        ]
+        alpha_tok = bytes.fromhex(
+            ek.blind_token_hex("tag", "aerodrome_slipstream_rebalance_1400utc")
+        )
+        j_rows = []
+        for idx, mem in enumerate(fx["raw_memories"]):
+            real_toks = [bytes.fromhex(ek.blind_token_hex("tag", t)) for t in mem["tags"]]
+            pad_i = 0
+            while len(real_toks) < 4:
+                cand = bytes.fromhex(ek.blind_token_hex("pad", f"{idx}:{pad_i}"))
+                pad_i += 1
+                if cand not in real_toks:
+                    real_toks.append(cand)
+            j_rows.append(
+                {
+                    "doc_id_tok_hex": ek.blind_token_hex("doc", mem["id"]),
+                    "doc_blob_hex": ek.seal_json_hex(mem["note"]),
+                    "tok_slots_hex": [t.hex() for t in sorted(real_toks)],
+                    "num_slots_hex": [
+                        (ptoks[fi] + pk.encrypt_int(int(mem["counts"][vname]))).hex()
+                        for fi, vname in enumerate(vocab_names)
+                    ],
+                }
+            )
+        client.ingest_blind_jsonb(j_tbl, j_rows)
+        r_cont = client.query_blind_jsonb(
+            j_tbl, "CONTAINS", contains_tokens_hex=[alpha_tok.hex()]
+        )
+        assert int(r_cont["matched_count"]) == 1
+        opened_doc = ek.open_json(r_cont["docs"][0]["doc_blob_hex"])
+        assert opened_doc["memo"] == fx["expected_alpha_memo"]
+
+        # 2. Blind OLAP zero-key homomorphic SUM over {0, v} class indicator columns
+        cols = [
+            {"name": "doc", "kind": "sealed_blob"},
+            {"name": "p_ind", "kind": "blind_add"},
+            {"name": "b_ind", "kind": "blind_add"},
+        ]
+        for fi in range(4):
+            cols.append({"name": f"pf{fi}", "kind": "blind_add"})
+            cols.append({"name": f"bf{fi}", "kind": "blind_add"})
+        client.create_blind_table(b_tbl, cols)
+        o_rows = []
+        for mem in fx["raw_memories"]:
+            is_p = mem["label"] == fx["cls_phish"]
+            cts = {
+                "doc": ek.seal_json_hex({"id": mem["id"]}),
+                "p_ind": pk.encrypt_int_hex(1 if is_p else 0),
+                "b_ind": pk.encrypt_int_hex(0 if is_p else 1),
+            }
+            for fi, vname in enumerate(vocab_names):
+                cnt = int(mem["counts"][vname])
+                cts[f"pf{fi}"] = pk.encrypt_int_hex(cnt if is_p else 0)
+                cts[f"bf{fi}"] = pk.encrypt_int_hex(0 if is_p else cnt)
+            o_rows.append({"ciphertexts_hex": cts})
+        client.ingest_blind(b_tbl, o_rows)
+
+        dec_counts: dict[str, int] = {}
+        receipts_ok = True
+        for col_name in ("p_ind", "b_ind", "pf0", "pf1", "pf2", "pf3", "bf0", "bf1", "bf2", "bf3"):
+            r_sum = client.query_blind(b_tbl, "SUM", column=col_name)
+            assert "decrypted_aggregate" not in r_sum
+            ct_bytes = bytes.fromhex(r_sum["ct_result_hex"])
+            assert len(ct_bytes) == PLWE_EXPANDED_BYTES
+            receipts_ok = receipts_ok and verify_blind_receipt(
+                r_sum, "SUM", b_tbl, len(o_rows), ct_bytes
+            )
+            dec_counts[col_name] = pk.decrypt_int(ct_bytes)
+        assert receipts_ok
+        assert dec_counts["p_ind"] == 2 and dec_counts["b_ind"] == 2
+        wrong_key = BlindClientPlweKey.generate()
+        r_chk = client.query_blind(b_tbl, "SUM", column="pf0")
+        assert wrong_key.decrypt_int(r_chk["ct_result_hex"]) != dec_counts["pf0"]
+        return {
+            "live_server_url": target_url,
+            "live_zero_knowledge_verified": True,
+            "zero_server_keys_verified": True,
+            "contains_matched_count": int(r_cont["matched_count"]),
+            "contains_local_decrypt_verified": opened_doc["memo"] == fx["expected_alpha_memo"],
+            "plwe_expanded_bytes": PLWE_EXPANDED_BYTES,
+            "receipts_verified": receipts_ok,
+            "phish_docs_decrypted": dec_counts["p_ind"],
+            "benign_docs_decrypted": dec_counts["b_ind"],
+        }
+    finally:
+        if proc is not None:
+            proc.terminate()
+            proc.wait(timeout=5)
+        if td_obj is not None:
+            td_obj.cleanup()
+
+
 # ---------------------------------------------------------------------------
 # Public Contract Entry Point
 # ---------------------------------------------------------------------------
 
-def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]:
-    if mode not in ("local", "testnet"):
+def run_demo(
+    mode: str = "local",
+    gate_url: str | None = None,
+    api_url: str | None = None,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    if mode not in ("local", "testnet", "live"):
         raise ValueError(f"unsupported mode: {mode!r}")
     t0 = time.perf_counter()
 
     local_out = _run_local_pipeline()
     testnet_probe: dict[str, Any] | None = None
+    live_probe: dict[str, Any] | None = None
     http_402_observed = bool(local_out["http_402_observed"])
 
     if mode == "testnet":
         target_url = (gate_url or os.environ.get("BLINDCORE_GATE_URL") or DEFAULT_TESTNET_GATE_URL).strip()
         testnet_probe = _probe_testnet(target_url)
         http_402_observed = bool(testnet_probe["live_402_observed"] and local_out["http_402_observed"])
+    elif mode == "live":
+        live_probe = _run_live_backend_probe(api_url=api_url, api_token=api_token)
 
     ok = (
         http_402_observed
@@ -1216,6 +1463,8 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
     )
     if mode == "testnet" and testnet_probe is not None:
         ok = ok and bool(testnet_probe["health_ok"]) and bool(testnet_probe["live_402_observed"])
+    if mode == "live" and live_probe is not None:
+        ok = ok and bool(live_probe["zero_server_keys_verified"]) and bool(live_probe["receipts_verified"])
 
     elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
     summary: dict[str, Any] = {
@@ -1224,6 +1473,9 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
     }
     if testnet_probe is not None:
         summary["testnet_probe"] = testnet_probe
+    if live_probe is not None:
+        summary["live_backend_probe"] = live_probe
+        summary["live_zero_knowledge_backend"] = live_probe
 
     return {
         "app_id": APP_ID,
@@ -1243,14 +1495,21 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=APP_TITLE)
-    parser.add_argument("--mode", choices=("local", "testnet"), default="local")
+    parser.add_argument("--mode", choices=("local", "testnet", "live"), default="local")
     parser.add_argument(
         "--gate-url",
         default=os.environ.get("BLINDCORE_GATE_URL", DEFAULT_TESTNET_GATE_URL),
         help="Target BlindCore Tri-Rail Gate URL (used in --mode testnet)",
     )
+    parser.add_argument("--api-url", default=os.environ.get("BLINDCORE_API_URL", ""))
+    parser.add_argument("--api-token", default=os.environ.get("BLINDCORE_API_TOKEN", ""))
     args = parser.parse_args()
-    res = run_demo(mode=args.mode, gate_url=args.gate_url)
+    res = run_demo(
+        mode=args.mode,
+        gate_url=args.gate_url,
+        api_url=args.api_url or None,
+        api_token=args.api_token or None,
+    )
     print(json.dumps(res, indent=2, sort_keys=True))
     if res["status"] != "PASS":
         sys.exit(1)

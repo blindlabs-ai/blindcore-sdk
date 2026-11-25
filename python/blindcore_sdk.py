@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import http.client
 import json
 import os
+import secrets
 import socket
 import ssl
 import struct
@@ -27,6 +29,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, Iterator, List, Optional, Union
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _CRYPTO_AESGCM
+except Exception:  # pragma: no cover - optional acceleration; pure-stdlib fallback included
+    _CRYPTO_AESGCM = None
 
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_FRAME_BYTES = 67108864
@@ -639,12 +646,26 @@ class BlindCoreClient:
         if weight is not None:
             payload["weight"] = int(weight)
         if where is not None:
-            if not isinstance(where, dict) or "column" not in where or "eq" not in where:
-                raise ValueError("where must be a {'column': ..., 'eq': ...} dict")
+            if not isinstance(where, dict) or "column" not in where:
+                raise ValueError("where must be a {'column': ..., 'eq': ...} or {'column': ..., 'eq_token_hex': ...} dict")
             wcol = str(where["column"]).strip()
             if not wcol or _has_ctl(wcol):
                 raise ValueError("where['column'] must be non-empty without control characters")
-            payload["where"] = {"column": wcol, "eq": int(where["eq"])}
+            has_eq = "eq" in where and where["eq"] is not None
+            has_tok = "eq_token_hex" in where and where["eq_token_hex"] is not None
+            if has_eq == has_tok:
+                raise ValueError("where must specify exactly one of 'eq' or 'eq_token_hex'")
+            if has_tok:
+                tok_s = str(where["eq_token_hex"]).strip()
+                if len(tok_s) != 64 or _has_ctl(tok_s):
+                    raise ValueError("where['eq_token_hex'] must be a 64-character hex string")
+                try:
+                    bytes.fromhex(tok_s)
+                except ValueError as exc:
+                    raise ValueError("where['eq_token_hex'] must be valid hex") from exc
+                payload["where"] = {"column": wcol, "eq_token_hex": tok_s}
+            else:
+                payload["where"] = {"column": wcol, "eq": int(where["eq"])}
         if threshold_decrypt is not None:
             if isinstance(threshold_decrypt, (tuple, list)) and len(threshold_decrypt) == 2:
                 t_val, n_val = int(threshold_decrypt[0]), int(threshold_decrypt[1])
@@ -1309,3 +1330,570 @@ class BlindMailClient:
             f"/v1/mail/dns/{urllib.parse.quote(domain)}",
             method="GET",
         )
+
+
+# ---------------------------------------------------------------------------
+# Client-Side Zero-Knowledge Cryptographic Primitives (Mode 2)
+# ---------------------------------------------------------------------------
+
+LWE_DIM = 1024
+LWE_Q0 = (1 << 127) - 1
+LWE_PLAIN_MOD = 890_969_009_638_765_049
+PLWE_MAGIC = b"PLWE0001"
+PLWE_PROFILE_D0 = 0
+PLWE_SEEDED_BYTES = 80
+PLWE_EXPANDED_BYTES = 16464
+SBLB_MAGIC = b"SBLB0001"
+SBLB_BUCKETS = (64, 128, 256, 512, 1024, 2048, 4096)
+
+_CRC32C_TABLE: tuple[int, ...] = tuple(
+    (lambda c: [c := ((c >> 1) ^ 0x82F63B78 if (c & 1) else (c >> 1)) for _ in range(8)][-1])(i)
+    for i in range(256)
+)
+
+
+def crc32c(data: bytes) -> int:
+    """Compute Castagnoli CRC-32C (polynomial 0x82F63B78)."""
+    crc = 0xFFFFFFFF
+    tbl = _CRC32C_TABLE
+    for byte in data:
+        crc = tbl[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    return crc ^ 0xFFFFFFFF
+
+
+def _coerce_frame_bytes(frame: bytes | bytearray | memoryview | str, label: str = "frame") -> bytes:
+    if isinstance(frame, str):
+        raw = bytes.fromhex(frame.strip())
+    elif isinstance(frame, (bytes, bytearray, memoryview)):
+        raw = bytes(frame)
+    else:
+        raise TypeError(f"{label} must be bytes or hex str")
+    return raw
+
+
+def _expand_plwe_a(seed_a: bytes) -> list[int]:
+    if len(seed_a) != 16:
+        raise ValueError("seed_a must be exactly 16 bytes")
+    pref = hashlib.sha256(b"PLWE0001-D0-A" + seed_a)
+    q0 = LWE_Q0
+    a = [0] * LWE_DIM
+    from_bytes = int.from_bytes
+    for ctr in range(LWE_DIM // 2):
+        h = pref.copy()
+        h.update(ctr.to_bytes(4, "little"))
+        d = h.digest()
+        v0 = from_bytes(d[:16], "little") & q0
+        v1 = from_bytes(d[16:], "little") & q0
+        a[2 * ctr] = 0 if v0 == q0 else v0
+        a[2 * ctr + 1] = 0 if v1 == q0 else v1
+    return a
+
+
+def _unpack_plwe_components(frame: bytes | bytearray | memoryview | str) -> tuple[list[int], int]:
+    raw = _coerce_frame_bytes(frame, "PLWE0001 frame")
+    if len(raw) < 64 or raw[:8] != PLWE_MAGIC:
+        raise ValueError("invalid PLWE0001 header magic")
+    ver, prof, n_val, k_val, t_mod, _scale, _qid, seed_a, plen, stored_crc = struct.unpack(
+        "<HBBIQQq16sII", raw[8:64]
+    )
+    if ver != 1 or prof != PLWE_PROFILE_D0 or n_val != 1 or k_val != 1:
+        raise ValueError(f"unsupported PLWE0001 header params: ver={ver} prof={prof}")
+    if t_mod != LWE_PLAIN_MOD:
+        raise ValueError(f"unexpected LWE_PLAIN_MOD: {t_mod}")
+    payload = raw[64:]
+    if len(payload) != plen:
+        raise ValueError(f"PLWE0001 payload length mismatch: expected {plen}, got {len(payload)}")
+    if crc32c(raw[:60] + payload) != stored_crc:
+        raise ValueError("PLWE0001 CRC-32C checksum mismatch")
+    if plen == 16:
+        a = _expand_plwe_a(seed_a)
+        b = int.from_bytes(payload, "little") % LWE_Q0
+        return a, b
+    if plen == (LWE_DIM + 1) * 16:
+        from_bytes = int.from_bytes
+        a = [from_bytes(payload[i * 16 : (i + 1) * 16], "little") % LWE_Q0 for i in range(LWE_DIM)]
+        b = from_bytes(payload[LWE_DIM * 16 : (LWE_DIM + 1) * 16], "little") % LWE_Q0
+        return a, b
+    raise ValueError(f"unsupported PLWE0001 payload length: {plen}")
+
+
+def _pack_plwe_expanded(a: list[int], b: int) -> bytes:
+    if len(a) != LWE_DIM:
+        raise ValueError(f"expanded LWE vector must have length {LWE_DIM}")
+    q0 = LWE_Q0
+    buf = bytearray((LWE_DIM + 1) * 16)
+    for i, ai in enumerate(a):
+        buf[i * 16 : (i + 1) * 16] = (ai % q0).to_bytes(16, "little")
+    buf[LWE_DIM * 16 : (LWE_DIM + 1) * 16] = (b % q0).to_bytes(16, "little")
+    payload = bytes(buf)
+    hdr60 = PLWE_MAGIC + struct.pack(
+        "<HBBIQQq16sI",
+        1,
+        PLWE_PROFILE_D0,
+        1,
+        1,
+        LWE_PLAIN_MOD,
+        1,
+        1,
+        bytes(16),
+        len(payload),
+    )
+    crc = crc32c(hdr60 + payload)
+    return hdr60 + struct.pack("<I", crc) + payload
+
+
+class BlindClientPlweKey:
+    """
+    Client-held Depth-0 additive homomorphic LWE key (PLWE0001, profile 0).
+
+    The ternary secret vector s in {-1, 0, 1}^1024 never leaves the client.
+    - Client encrypts signed integers into 80-byte randomized IND-CPA frames.
+    - Server evaluates SUM and WEIGHTED_SUM strictly over ciphertexts with zero
+      keys and returns a 16,464-byte expanded PLWE0001 ciphertext.
+    - Client decrypts locally with exact integer recovery mod LWE_PLAIN_MOD.
+    """
+
+    def __init__(self, secret_seed: bytes) -> None:
+        if not isinstance(secret_seed, (bytes, bytearray)) or len(secret_seed) != 32:
+            raise ValueError("secret_seed must be exactly 32 bytes")
+        self._seed = bytes(secret_seed)
+        sk: list[int] = []
+        for ctr in range(8):
+            blk = hashlib.sha256(
+                b"BLINDCORE-D0-S" + self._seed + ctr.to_bytes(4, "little")
+            ).digest()
+            for byte in blk:
+                v = byte
+                for _ in range(4):
+                    sk.append((v & 1) - ((v >> 1) & 1))
+                    v >>= 2
+        self._sk: tuple[int, ...] = tuple(sk)
+        # Precompute non-zero secret pairs to skip (0, 0) SHA-256 blocks identically
+        self._active_pairs: tuple[tuple[bytes, int, int], ...] = tuple(
+            (ctr.to_bytes(4, "little"), sk[2 * ctr], sk[2 * ctr + 1])
+            for ctr in range(LWE_DIM // 2)
+            if sk[2 * ctr] != 0 or sk[2 * ctr + 1] != 0
+        )
+        self._pos_indices: tuple[int, ...] = tuple(i for i, s in enumerate(sk) if s == 1)
+        self._neg_indices: tuple[int, ...] = tuple(i for i, s in enumerate(sk) if s == -1)
+
+    @classmethod
+    def generate(cls) -> "BlindClientPlweKey":
+        return cls(secrets.token_bytes(32))
+
+    @classmethod
+    def from_seed(cls, seed: bytes) -> "BlindClientPlweKey":
+        return cls(seed)
+
+    @property
+    def seed(self) -> bytes:
+        return self._seed
+
+    def encrypt_int(self, val: int) -> bytes:
+        """Encrypt a signed integer into an 80-byte IND-CPA seeded PLWE0001 frame."""
+        ival = int(val)
+        half = LWE_PLAIN_MOD // 2
+        if ival < -half or ival > half:
+            raise ValueError(f"plaintext integer out of signed range [-{half}, {half}]")
+        seed_a = os.urandom(16)
+        eb = os.urandom(1)[0]
+        err = (eb & 7).bit_count() - ((eb >> 3) & 7).bit_count()
+        pref = hashlib.sha256(b"PLWE0001-D0-A" + seed_a)
+        q0 = LWE_Q0
+        from_bytes = int.from_bytes
+        dot = 0
+        for ctr_le, s0, s1 in self._active_pairs:
+            h = pref.copy()
+            h.update(ctr_le)
+            d = h.digest()
+            if s0:
+                v0 = from_bytes(d[:16], "little") & q0
+                if v0 != q0:
+                    dot += v0 if s0 == 1 else -v0
+            if s1:
+                v1 = from_bytes(d[16:], "little") & q0
+                if v1 != q0:
+                    dot += v1 if s1 == 1 else -v1
+        dot %= q0
+        b = (dot + (ival % LWE_PLAIN_MOD) + err * LWE_PLAIN_MOD) % q0
+        payload = b.to_bytes(16, "little")
+        hdr60 = PLWE_MAGIC + struct.pack(
+            "<HBBIQQq16sI",
+            1,
+            PLWE_PROFILE_D0,
+            1,
+            1,
+            LWE_PLAIN_MOD,
+            1,
+            1,
+            seed_a,
+            16,
+        )
+        crc = crc32c(hdr60 + payload)
+        return hdr60 + struct.pack("<I", crc) + payload
+
+    def encrypt_int_hex(self, val: int) -> str:
+        return self.encrypt_int(val).hex()
+
+    def decrypt_int(self, frame: bytes | bytearray | memoryview | str) -> int:
+        """Decrypt an 80-byte seeded or 16,464-byte expanded PLWE0001 frame locally."""
+        a, b = _unpack_plwe_components(frame)
+        dot = (sum(a[i] for i in self._pos_indices) - sum(a[i] for i in self._neg_indices)) % LWE_Q0
+        diff = (b - dot) % LWE_Q0
+        if diff > LWE_Q0 // 2:
+            rem = (LWE_Q0 - diff) % LWE_PLAIN_MOD
+            raw = 0 if rem == 0 else LWE_PLAIN_MOD - rem
+        else:
+            raw = diff % LWE_PLAIN_MOD
+        return raw - LWE_PLAIN_MOD if raw > LWE_PLAIN_MOD // 2 else raw
+
+    @staticmethod
+    def homomorphic_add(
+        ct_a: bytes | bytearray | memoryview | str,
+        ct_b: bytes | bytearray | memoryview | str,
+    ) -> bytes:
+        """Zero-key homomorphic ciphertext addition returning a 16,464-byte PLWE0001 frame."""
+        a1, b1 = _unpack_plwe_components(ct_a)
+        a2, b2 = _unpack_plwe_components(ct_b)
+        q0 = LWE_Q0
+        return _pack_plwe_expanded([(x + y) % q0 for x, y in zip(a1, a2)], (b1 + b2) % q0)
+
+    @staticmethod
+    def homomorphic_scale(
+        ct: bytes | bytearray | memoryview | str,
+        weight: int,
+    ) -> bytes:
+        """Zero-key homomorphic scalar multiplication returning a 16,464-byte PLWE0001 frame."""
+        a1, b1 = _unpack_plwe_components(ct)
+        q0 = LWE_Q0
+        w = int(weight) % q0
+        return _pack_plwe_expanded([(x * w) % q0 for x in a1], (b1 * w) % q0)
+
+    @staticmethod
+    def homomorphic_weighted_sum(
+        frames: list[bytes | bytearray | memoryview | str],
+        weights: list[int] | None = None,
+    ) -> bytes:
+        """Zero-key homomorphic weighted sum returning a 16,464-byte PLWE0001 frame."""
+        q0 = LWE_Q0
+        acc_a = [0] * LWE_DIM
+        acc_b = 0
+        if not frames:
+            return _pack_plwe_expanded(acc_a, 0)
+        if weights is not None and len(weights) != len(frames):
+            raise ValueError("weights length must match frames length")
+        for idx, fr in enumerate(frames):
+            w = 1 if weights is None else int(weights[idx])
+            if w == 0:
+                continue
+            a_i, b_i = _unpack_plwe_components(fr)
+            w_mod = w % q0
+            if w_mod == 1:
+                for j in range(LWE_DIM):
+                    acc_a[j] = (acc_a[j] + a_i[j]) % q0
+                acc_b = (acc_b + b_i) % q0
+            else:
+                for j in range(LWE_DIM):
+                    acc_a[j] = (acc_a[j] + a_i[j] * w_mod) % q0
+                acc_b = (acc_b + b_i * w_mod) % q0
+        return _pack_plwe_expanded(acc_a, acc_b)
+
+
+# Compact pure-stdlib NIST SP 800-38D AES-256-GCM fallback (used only when
+# `cryptography` is not installed so blindcore_sdk.py remains 0-dep).
+_AES_SBOX = (
+    0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5, 0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76,
+    0xCA, 0x82, 0xC9, 0x7D, 0xFA, 0x59, 0x47, 0xF0, 0xAD, 0xD4, 0xA2, 0xAF, 0x9C, 0xA4, 0x72, 0xC0,
+    0xB7, 0xFD, 0x93, 0x26, 0x36, 0x3F, 0xF7, 0xCC, 0x34, 0xA5, 0xE5, 0xF1, 0x71, 0xD8, 0x31, 0x15,
+    0x04, 0xC7, 0x23, 0xC3, 0x18, 0x96, 0x05, 0x9A, 0x07, 0x12, 0x80, 0xE2, 0xEB, 0x27, 0xB2, 0x75,
+    0x09, 0x83, 0x2C, 0x1A, 0x1B, 0x6E, 0x5A, 0xA0, 0x52, 0x3B, 0xD6, 0xB3, 0x29, 0xE3, 0x2F, 0x84,
+    0x53, 0xD1, 0x00, 0xED, 0x20, 0xFC, 0xB1, 0x5B, 0x6A, 0xCB, 0xBE, 0x39, 0x4A, 0x4C, 0x58, 0xCF,
+    0xD0, 0xEF, 0xAA, 0xFB, 0x43, 0x4D, 0x33, 0x85, 0x45, 0xF9, 0x02, 0x7F, 0x50, 0x3C, 0x9F, 0xA8,
+    0x51, 0xA3, 0x40, 0x8F, 0x92, 0x9D, 0x38, 0xF5, 0xBC, 0xB6, 0xDA, 0x21, 0x10, 0xFF, 0xF3, 0xD2,
+    0xCD, 0x0C, 0x13, 0xEC, 0x5F, 0x97, 0x44, 0x17, 0xC4, 0xA7, 0x7E, 0x3D, 0x64, 0x5D, 0x19, 0x73,
+    0x60, 0x81, 0x4F, 0xDC, 0x22, 0x2A, 0x90, 0x88, 0x46, 0xEE, 0xB8, 0x14, 0xDE, 0x5E, 0x0B, 0xDB,
+    0xE0, 0x32, 0x3A, 0x0A, 0x49, 0x06, 0x24, 0x5C, 0xC2, 0xD3, 0xAC, 0x62, 0x91, 0x95, 0xE4, 0x79,
+    0xE7, 0xC8, 0x37, 0x6D, 0x8D, 0xD5, 0x4E, 0xA9, 0x6C, 0x56, 0xF4, 0xEA, 0x65, 0x7A, 0xAE, 0x08,
+    0xBA, 0x78, 0x25, 0x2E, 0x1C, 0xA6, 0xB4, 0xC6, 0xE8, 0xDD, 0x74, 0x1F, 0x4B, 0xBD, 0x8B, 0x8A,
+    0x70, 0x3E, 0xB5, 0x66, 0x48, 0x03, 0xF6, 0x0E, 0x61, 0x35, 0x57, 0xB9, 0x86, 0xC1, 0x1D, 0x9E,
+    0xE1, 0xF8, 0x98, 0x11, 0x69, 0xD9, 0x8E, 0x94, 0x9B, 0x1E, 0x87, 0xE9, 0xCE, 0x55, 0x28, 0xDF,
+    0x8C, 0xA1, 0x89, 0x0D, 0xBF, 0xE6, 0x42, 0x68, 0x41, 0x99, 0x2D, 0x0F, 0xB0, 0x54, 0xBB, 0x16,
+)
+_AES_RCON = (0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40)
+
+
+def _aes256_expand_key(key: bytes) -> list[bytes]:
+    w = [list(key[i : i + 4]) for i in range(0, 32, 4)]
+    for i in range(8, 60):
+        t = list(w[i - 1])
+        if i % 8 == 0:
+            t = [_AES_SBOX[t[1]] ^ _AES_RCON[(i // 8) - 1], _AES_SBOX[t[2]], _AES_SBOX[t[3]], _AES_SBOX[t[0]]]
+        elif i % 8 == 4:
+            t = [_AES_SBOX[b] for b in t]
+        w.append([w[i - 8][j] ^ t[j] for j in range(4)])
+    return [bytes(sum(w[r * 4 : (r + 1) * 4], [])) for r in range(15)]
+
+
+def _xtime(a: int) -> int:
+    return ((a << 1) ^ 0x1B) & 0xFF if (a & 0x80) else (a << 1)
+
+
+def _aes256_encrypt_block(rk: list[bytes], block: bytes) -> bytes:
+    s = [block[i] ^ rk[0][i] for i in range(16)]
+    for r in range(1, 15):
+        s = [_AES_SBOX[b] for b in s]
+        s = [
+            s[0], s[5], s[10], s[15],
+            s[4], s[9], s[14], s[3],
+            s[8], s[13], s[2], s[7],
+            s[12], s[1], s[6], s[11],
+        ]
+        if r != 14:
+            ns = [0] * 16
+            for c in range(0, 16, 4):
+                a0, a1, a2, a3 = s[c], s[c + 1], s[c + 2], s[c + 3]
+                t = a0 ^ a1 ^ a2 ^ a3
+                ns[c] = a0 ^ t ^ _xtime(a0 ^ a1)
+                ns[c + 1] = a1 ^ t ^ _xtime(a1 ^ a2)
+                ns[c + 2] = a2 ^ t ^ _xtime(a2 ^ a3)
+                ns[c + 3] = a3 ^ t ^ _xtime(a3 ^ a0)
+            s = ns
+        k = rk[r]
+        s = [s[i] ^ k[i] for i in range(16)]
+    return bytes(s)
+
+
+def _gf128_mul(x: int, y: int) -> int:
+    z = 0
+    v = y
+    for i in range(128):
+        if (x >> (127 - i)) & 1:
+            z ^= v
+        if v & 1:
+            v = (v >> 1) ^ (0xE1 << 120)
+        else:
+            v >>= 1
+    return z
+
+
+def _ghash(h_int: int, aad: bytes, ct: bytes) -> bytes:
+    y = 0
+    for buf in (aad, ct):
+        rem = len(buf) % 16
+        padded = buf + (bytes(16 - rem) if rem else b"")
+        for off in range(0, len(padded), 16):
+            blk = int.from_bytes(padded[off : off + 16], "big")
+            y = _gf128_mul(y ^ blk, h_int)
+    lens = ((len(aad) * 8) << 64) | (len(ct) * 8)
+    y = _gf128_mul(y ^ lens, h_int)
+    return y.to_bytes(16, "big")
+
+
+class _PureAes256Gcm:
+    """Zero-dependency NIST SP 800-38D AES-256-GCM fallback."""
+
+    def __init__(self, key: bytes) -> None:
+        if len(key) != 32:
+            raise ValueError("AES-256-GCM key must be 32 bytes")
+        self._rk = _aes256_expand_key(key)
+        self._h = int.from_bytes(_aes256_encrypt_block(self._rk, bytes(16)), "big")
+
+    def _ctr_xor(self, nonce: bytes, data: bytes) -> bytes:
+        out = bytearray(len(data))
+        ctr = 2
+        for off in range(0, len(data), 16):
+            ks = _aes256_encrypt_block(self._rk, nonce + struct.pack(">I", ctr))
+            chunk = data[off : off + 16]
+            out[off : off + len(chunk)] = bytes(a ^ b for a, b in zip(chunk, ks))
+            ctr = (ctr + 1) & 0xFFFFFFFF
+        return bytes(out)
+
+    def encrypt(self, nonce: bytes, data: bytes, aad: bytes) -> bytes:
+        if len(nonce) != 12:
+            raise ValueError("AES-GCM nonce must be 12 bytes")
+        ct = self._ctr_xor(nonce, data)
+        j0 = _aes256_encrypt_block(self._rk, nonce + b"\x00\x00\x00\x01")
+        s_tag = _ghash(self._h, aad, ct)
+        tag = bytes(a ^ b for a, b in zip(j0, s_tag))
+        return ct + tag
+
+    def decrypt(self, nonce: bytes, data: bytes, aad: bytes) -> bytes:
+        if len(nonce) != 12 or len(data) < 16:
+            raise ValueError("invalid AES-GCM ciphertext or nonce")
+        ct, tag = data[:-16], data[-16:]
+        j0 = _aes256_encrypt_block(self._rk, nonce + b"\x00\x00\x00\x01")
+        expected = bytes(a ^ b for a, b in zip(j0, _ghash(self._h, aad, ct)))
+        if not hmac.compare_digest(tag, expected):
+            raise ValueError("AES-256-GCM authentication tag verification failed")
+        return self._ctr_xor(nonce, ct)
+
+
+class BlindClientEnvelopeKey:
+    """
+    Client-held SBLB0001 padded AEAD envelope and blind-token key.
+
+    Server validates only the 24-byte SBLB0001 header, bucket size in
+    {64, 128, 256, 512, 1024, 2048, 4096}, and 16-byte authentication tag.
+    The AES-256-GCM DEK and blind-token HMAC key never leave the client.
+    """
+
+    def __init__(self, key: bytes) -> None:
+        if not isinstance(key, (bytes, bytearray)) or len(key) != 32:
+            raise ValueError("envelope key must be exactly 32 bytes")
+        self._key = bytes(key)
+        self._tok_key = hmac.new(self._key, b"blindcore:sblb:tok:v1", hashlib.sha256).digest()
+        self._path_key = hmac.new(self._key, b"blindcore:sblb:path:v1", hashlib.sha256).digest()
+        self._aead: Any = (
+            _CRYPTO_AESGCM(self._key) if _CRYPTO_AESGCM is not None else _PureAes256Gcm(self._key)
+        )
+
+    @classmethod
+    def generate(cls) -> "BlindClientEnvelopeKey":
+        return cls(secrets.token_bytes(32))
+
+    @classmethod
+    def from_key(cls, key: bytes) -> "BlindClientEnvelopeKey":
+        return cls(key)
+
+    @property
+    def key(self) -> bytes:
+        return self._key
+
+    def seal(self, plaintext: bytes, aad: bytes = b"") -> bytes:
+        """Seal bytes into an SBLB0001 power-of-two bucketed AES-256-GCM frame."""
+        if not isinstance(plaintext, (bytes, bytearray)):
+            raise TypeError("plaintext must be bytes")
+        pt = bytes(plaintext)
+        need = 4 + len(pt)
+        bucket = 0
+        for cand in SBLB_BUCKETS:
+            if cand >= need:
+                bucket = cand
+                break
+        if bucket == 0:
+            raise ValueError(f"plaintext too large for SBLB0001 max bucket ({SBLB_BUCKETS[-1] - 4} B)")
+        padded = struct.pack(">I", len(pt)) + pt + bytes(bucket - need)
+        nonce = os.urandom(12)
+        hdr24 = SBLB_MAGIC + struct.pack("<HH", 1, bucket) + nonce
+        ct_tag = self._aead.encrypt(nonce, padded, hdr24 + aad)
+        return hdr24 + ct_tag
+
+    def seal_hex(self, plaintext: bytes, aad: bytes = b"") -> str:
+        return self.seal(plaintext, aad=aad).hex()
+
+    def open(self, frame: bytes | bytearray | memoryview | str, aad: bytes = b"") -> bytes:
+        """Authenticate and unpad an SBLB0001 frame locally."""
+        raw = _coerce_frame_bytes(frame, "SBLB0001 frame")
+        if len(raw) < 40 or raw[:8] != SBLB_MAGIC:
+            raise ValueError("invalid SBLB0001 header magic")
+        ver, bucket = struct.unpack("<HH", raw[8:12])
+        if ver != 1 or bucket not in SBLB_BUCKETS:
+            raise ValueError(f"unsupported SBLB0001 version/bucket: ver={ver} bucket={bucket}")
+        if len(raw) != 24 + bucket + 16:
+            raise ValueError("SBLB0001 frame length mismatch")
+        hdr24 = raw[:24]
+        nonce = raw[12:24]
+        ct_tag = raw[24:]
+        try:
+            padded = self._aead.decrypt(nonce, ct_tag, hdr24 + aad)
+        except Exception as exc:
+            raise ValueError("SBLB0001 AES-256-GCM decryption failed") from exc
+        if len(padded) != bucket:
+            raise ValueError("SBLB0001 decrypted bucket length mismatch")
+        pt_len = struct.unpack(">I", padded[:4])[0]
+        if pt_len > bucket - 4:
+            raise ValueError("SBLB0001 invalid plaintext length prefix")
+        if any(padded[4 + pt_len :]):
+            raise ValueError("SBLB0001 non-zero padding bytes")
+        return padded[4 : 4 + pt_len]
+
+    def seal_json(self, obj: Any, aad: bytes = b"") -> bytes:
+        raw = json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        return self.seal(raw, aad=aad)
+
+    def seal_json_hex(self, obj: Any, aad: bytes = b"") -> str:
+        return self.seal_json(obj, aad=aad).hex()
+
+    def open_json(self, frame: bytes | bytearray | memoryview | str, aad: bytes = b"") -> Any:
+        return json.loads(self.open(frame, aad=aad).decode("utf-8"))
+
+    def blind_token_hex(self, namespace: str, value: str) -> str:
+        """Derive a 32-byte (64-hex) client-keyed HMAC-SHA256 blind token."""
+        return hmac.new(
+            self._tok_key,
+            f"{namespace}:{value}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def derive_path_token_hex(self, path: str) -> str:
+        """Derive a 32-byte (64-hex) client-keyed BlindJSONB numeric path token."""
+        return hmac.new(
+            self._path_key,
+            f"path:{path}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+
+def generate_zero_sum_masks(
+    secret_key: bytes,
+    cohort_id: str,
+    count: int,
+    bound: int = 500_000,
+    floor: int = 100_000,
+) -> list[int]:
+    """
+    Generate secret-keyed HMAC-SHA256 zero-sum blinding masks for a cohort.
+
+    Requires a >= 32-byte client/consortium secret key so masks cannot be
+    reconstructed from the public or semi-public cohort identifier alone.
+    """
+    if not isinstance(secret_key, (bytes, bytearray)) or len(secret_key) < 32:
+        raise ValueError("secret_key must be at least 32 bytes")
+    if count < 0:
+        raise ValueError("count must be non-negative")
+    if count <= 1:
+        return [0] * count
+    if bound <= 0 or floor < 0:
+        raise ValueError("bound must be > 0 and floor >= 0")
+    masks: list[int] = []
+    running = 0
+    key_bytes = bytes(secret_key)
+    for idx in range(count - 1):
+        digest = hmac.new(
+            key_bytes,
+            f"blindcore:mask:v1|{cohort_id}|{idx}".encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        val = int.from_bytes(digest[:4], "big") % bound + floor
+        if digest[4] & 1:
+            val = -val
+        masks.append(val)
+        running += val
+    masks.append(-running)
+    return masks
+
+
+def verify_blind_receipt(
+    resp: dict[str, Any],
+    kind: str,
+    table: str,
+    count: int,
+    payload: bytes,
+) -> bool:
+    """Verify a live server NSAU0001 cryptographic query/ingest receipt."""
+    if not isinstance(resp, dict):
+        return False
+    if resp.get("receipt_magic") != "NSAU0001":
+        return False
+    got = resp.get("receipt_hex")
+    if not isinstance(got, str) or len(got) != 64:
+        return False
+    expected = hashlib.sha256(
+        b"NSAU0001:BLIND:"
+        + kind.encode("utf-8")
+        + b":"
+        + table.encode("utf-8")
+        + struct.pack("<Q", int(count))
+        + payload
+    ).hexdigest()
+    return hmac.compare_digest(got.lower(), expected)

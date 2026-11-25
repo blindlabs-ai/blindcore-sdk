@@ -44,7 +44,9 @@ import json
 import os
 import re
 import secrets
+import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -67,6 +69,25 @@ from gate.blindcore_trirail_gate import (  # noqa: E402
     build_server,
     sha256_hex,
 )
+
+try:
+    from python.blindcore_sdk import (  # noqa: E402
+        BlindClientEnvelopeKey,
+        BlindClientPlweKey,
+        BlindCoreClient,
+        PLWE_EXPANDED_BYTES,
+        PLWE_SEEDED_BYTES,
+        verify_blind_receipt,
+    )
+except ImportError:
+    from python.blindcore_client import (  # type: ignore[no-redef]  # noqa: E402
+        BlindClientEnvelopeKey,
+        BlindClientPlweKey,
+        BlindCoreClient,
+        PLWE_EXPANDED_BYTES,
+        PLWE_SEEDED_BYTES,
+        verify_blind_receipt,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -104,14 +125,14 @@ SECP256K1_HALF_N = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681
 class DarkPoolOrderCipher:
     """
     Client-committee blinding engine for non-custodial sealed-bid batches.
-    - Order-preserving affine blinding for prices: ct_p = p * scale_p + bias_p
-      so comparisons (ct_bid >= ct_ask, ct_p in [ct_floor, ct_ceil]) and
-      midpoint clearing ((ct_bid + ct_ask) // 2) execute strictly over
-      ciphertexts while hiding raw prices on the wire.
-    - Multiplicative blinding for sizes: ct_q = q * scale_q so WEIGHTED_SUM
-      and matched-volume min/sum execute strictly over ciphertexts.
-    - Keyed HMAC-SHA256 blind tokens for order side and sealed EtM envelopes
-      for full order records.
+    - Randomized order-preserving blinding for prices:
+      ct_p = p * scale_p + bias_p + jitter, where jitter in [0, scale_p // 4)
+      prevents pairwise GCD recovery while keeping comparisons and midpoint
+      clearing ((ct_bid + ct_ask) // 2) bit-exact for both even and odd sums.
+    - IND-CPA 80-byte PLWE0001 encryption for order sizes and weighted sums
+      so zero-key homomorphic addition runs server-side with zero determinism
+      or divisibility leakage.
+    - AES-256-GCM SBLB0001 padded envelopes plus authenticated EtM records.
     """
 
     def __init__(self, batch_secret: bytes) -> None:
@@ -120,10 +141,13 @@ class DarkPoolOrderCipher:
         self._enc_key = hmac.new(batch_secret, b"blindcore:darkpool:enc:v1", hashlib.sha256).digest()
         self._mac_key = hmac.new(batch_secret, b"blindcore:darkpool:mac:v1", hashlib.sha256).digest()
         self._tok_key = hmac.new(batch_secret, b"blindcore:darkpool:tok:v1", hashlib.sha256).digest()
-        # Ephemeral positive odd blinding multipliers + 64-bit random price offset
+        self.plwe = BlindClientPlweKey.from_seed(
+            hmac.new(batch_secret, b"blindcore:darkpool:plwe:v1", hashlib.sha256).digest()
+        )
+        self.envelope_key = BlindClientEnvelopeKey.from_key(self._enc_key)
+        # Ephemeral positive odd price multiplier + 64-bit random price offset
         self.scale_p = (int.from_bytes(hmac.new(batch_secret, b"scale_p", hashlib.sha256).digest()[:6], "big") | 1) + (1 << 40)
         self.bias_p = int.from_bytes(hmac.new(batch_secret, b"bias_p", hashlib.sha256).digest()[:8], "big") + (1 << 60)
-        self.scale_q = (int.from_bytes(hmac.new(batch_secret, b"scale_q", hashlib.sha256).digest()[:6], "big") | 1) + (1 << 40)
 
     def blind_token(self, namespace: str, value: str) -> str:
         digest = hmac.new(
@@ -134,8 +158,14 @@ class DarkPoolOrderCipher:
         return f"dp_{digest[:24]}"
 
     def blind_price_hex(self, price_ticks: int) -> str:
-        ct = price_ticks * self.scale_p + self.bias_p
+        jitter = secrets.randbelow(self.scale_p // 4)
+        ct = price_ticks * self.scale_p + self.bias_p + jitter
         return hex(ct)
+
+    def blind_price_collar_hex(self, floor_ticks: int, ceil_ticks: int) -> tuple[str, str]:
+        ct_floor = floor_ticks * self.scale_p + self.bias_p
+        ct_ceil = ceil_ticks * self.scale_p + self.bias_p + (self.scale_p // 4)
+        return hex(ct_floor), hex(ct_ceil)
 
     def unblind_price(self, ct_price_hex: str) -> int:
         ct = int(ct_price_hex, 16)
@@ -143,13 +173,10 @@ class DarkPoolOrderCipher:
         return diff // self.scale_p
 
     def blind_size_hex(self, size_lots: int) -> str:
-        ct = size_lots * self.scale_q
-        return hex(ct)
+        return self.plwe.encrypt_int_hex(int(size_lots))
 
     def unblind_size(self, ct_size_hex: str) -> int:
-        ct = int(ct_size_hex, 16)
-        assert ct % self.scale_q == 0, "blinded size divisibility check failed"
-        return ct // self.scale_q
+        return self.plwe.decrypt_int(ct_size_hex)
 
     def _keystream(self, nonce: bytes, length: int) -> bytes:
         out = bytearray()
@@ -464,18 +491,13 @@ class _LocalDarkPoolUpstreamHandler(BaseHTTPRequestHandler):
         op = str(parsed.get("op", "RANGE_GATE")).strip().upper()
 
         if op == "WEIGHTED_SUM":
-            bid_tok = str(parsed["bid_side_token"])
-            ask_tok = str(parsed["ask_side_token"])
             orders = parsed.get("sealed_orders", [])
-            ct_bid_weighted = 0
-            ct_ask_weighted = 0
-            for order in orders:
-                w = int(order.get("weight_bps", 10_000))
-                ct_size = int(str(order["ct_size_hex"]), 16)
-                if str(order["side_token"]) == bid_tok:
-                    ct_bid_weighted += w * ct_size
-                elif str(order["side_token"]) == ask_tok:
-                    ct_ask_weighted += w * ct_size
+            ct_bid_weighted = BlindClientPlweKey.homomorphic_weighted_sum(
+                [str(o["ct_bid_weighted_hex"]) for o in orders]
+            )
+            ct_ask_weighted = BlindClientPlweKey.homomorphic_weighted_sum(
+                [str(o["ct_ask_weighted_hex"]) for o in orders]
+            )
             receipt = build_nsau0001_receipt(
                 state.epoch_seq, fee_micro, ts, table, pay_hash, gate_mac
             )
@@ -499,8 +521,8 @@ class _LocalDarkPoolUpstreamHandler(BaseHTTPRequestHandler):
                     "custody_model": "NON_CUSTODIAL_ZERO_ESCROW",
                     "plaintext_stored": False,
                     "order_count": len(orders),
-                    "ct_weighted_bid_size_hex": hex(ct_bid_weighted),
-                    "ct_weighted_ask_size_hex": hex(ct_ask_weighted),
+                    "ct_weighted_bid_size_hex": ct_bid_weighted.hex(),
+                    "ct_weighted_ask_size_hex": ct_ask_weighted.hex(),
                     "epoch_seq": state.epoch_seq,
                     "nsau0001_receipt": receipt,
                     "base_settle_proof": base_proof,
@@ -509,25 +531,20 @@ class _LocalDarkPoolUpstreamHandler(BaseHTTPRequestHandler):
             return
 
         # Stage 2: MEV-free encrypted RANGE_GATE & uniform sealed-bid batch clearing
-        bid_tok = str(parsed["bid_side_token"])
-        ask_tok = str(parsed["ask_side_token"])
         ct_floor = int(str(parsed["ct_reserve_floor_hex"]), 16)
         ct_ceil = int(str(parsed["ct_reserve_ceiling_hex"]), 16)
         orders = parsed.get("sealed_orders", [])
 
-        ct_bids: list[tuple[int, int, str]] = []
-        ct_asks: list[tuple[int, int, str]] = []
+        ct_bids: list[tuple[int, str, str]] = []
+        ct_asks: list[tuple[int, str, str]] = []
         for order in orders:
-            ct_p = int(str(order["ct_price_hex"]), 16)
-            ct_q = int(str(order["ct_size_hex"]), 16)
+            ct_bid_p = int(str(order["ct_bid_price_hex"]), 16)
+            ct_ask_p = int(str(order["ct_ask_price_hex"]), 16)
             mm_commit = str(order["mm_commitment"])
-            # Encrypted RANGE_GATE collar check: ct_floor <= ct_p <= ct_ceil
-            if ct_p < ct_floor or ct_p > ct_ceil:
-                continue
-            if str(order["side_token"]) == bid_tok:
-                ct_bids.append((ct_p, ct_q, mm_commit))
-            elif str(order["side_token"]) == ask_tok:
-                ct_asks.append((ct_p, ct_q, mm_commit))
+            if ct_floor <= ct_bid_p <= ct_ceil:
+                ct_bids.append((ct_bid_p, str(order["ct_bid_size_hex"]), mm_commit))
+            if ct_floor <= ct_ask_p <= ct_ceil:
+                ct_asks.append((ct_ask_p, str(order["ct_ask_size_hex"]), mm_commit))
 
         ct_bids.sort(key=lambda x: x[0], reverse=True)
         ct_asks.sort(key=lambda x: x[0])
@@ -542,13 +559,12 @@ class _LocalDarkPoolUpstreamHandler(BaseHTTPRequestHandler):
 
         crossing_bids = [b for b in ct_bids if b[0] >= best_ct_ask]
         crossing_asks = [a for a in ct_asks if a[0] <= best_ct_bid]
-        ct_bid_vol = sum(b[1] for b in crossing_bids)
-        ct_ask_vol = sum(a[1] for a in crossing_asks)
-        ct_matched_vol = min(ct_bid_vol, ct_ask_vol)
+        ct_bid_vol = BlindClientPlweKey.homomorphic_weighted_sum([b[1] for b in crossing_bids])
+        ct_ask_vol = BlindClientPlweKey.homomorphic_weighted_sum([a[1] for a in crossing_asks])
 
         matched_commitments = sorted({b[2] for b in crossing_bids} | {a[2] for a in crossing_asks})
         clear_commit = "0x" + sha256_hex(
-            f"{table}:{hex(ct_clear_price)}:{hex(ct_matched_vol)}:{','.join(matched_commitments)}".encode("utf-8")
+            f"{table}:{hex(ct_clear_price)}:{sha256_hex(ct_bid_vol)}:{sha256_hex(ct_ask_vol)}:{','.join(matched_commitments)}".encode("utf-8")
         )
 
         receipt = build_nsau0001_receipt(
@@ -595,7 +611,8 @@ class _LocalDarkPoolUpstreamHandler(BaseHTTPRequestHandler):
                 "crossing_bid_count": len(crossing_bids),
                 "crossing_ask_count": len(crossing_asks),
                 "ct_clearing_price_hex": hex(ct_clear_price),
-                "ct_matched_size_hex": hex(ct_matched_vol),
+                "ct_crossing_bid_vol_hex": ct_bid_vol.hex(),
+                "ct_crossing_ask_vol_hex": ct_ask_vol.hex(),
                 "clearing_commitment": clear_commit,
                 "matched_mm_commitments": matched_commitments,
                 "epoch_seq": state.epoch_seq,
@@ -791,10 +808,8 @@ def _build_x402_payment_header(req_accepts: dict[str, Any], payer_addr: str) -> 
 
 def _build_darkpool_fixtures(cipher: DarkPoolOrderCipher) -> dict[str, Any]:
     table_token = cipher.blind_token("batch", "otc_aero_sbtc_epoch_108")
-    bid_token = cipher.blind_token("side", "institutional_bid")
-    ask_token = cipher.blind_token("side", "institutional_ask")
 
-    # 4 Institutional Market Makers (plaintext names, prices, sizes NEVER sent on wire)
+    # 4 Institutional Market Makers (plaintext names, prices, sizes, weights NEVER sent on wire)
     raw_orders = [
         {"desk": "mm_citadel_otc_desk", "side": "BID", "price": 67480, "size": 1400, "weight_bps": 4000},
         {"desk": "mm_wintermute_aero", "side": "BID", "price": 67150, "size": 950, "weight_bps": 2500},
@@ -803,28 +818,59 @@ def _build_darkpool_fixtures(cipher: DarkPoolOrderCipher) -> dict[str, Any]:
     ]
     reserve_floor = 67000
     reserve_ceiling = 67800
+    ct_floor_hex, ct_ceil_hex = cipher.blind_price_collar_hex(reserve_floor, reserve_ceiling)
 
+    wsum_orders: list[dict[str, Any]] = []
     sealed_orders: list[dict[str, Any]] = []
     for item in raw_orders:
         salt = secrets.token_hex(16)
         mm_commit = "0x" + sha256_hex(f"{item['desk']}:{salt}".encode("utf-8"))[:40]
-        side_tok = bid_token if item["side"] == "BID" else ask_token
+        is_bid = item["side"] == "BID"
+        ct_bid_weighted_hex = cipher.plwe.encrypt_int_hex(
+            item["weight_bps"] * item["size"] if is_bid else 0
+        )
+        ct_ask_weighted_hex = cipher.plwe.encrypt_int_hex(
+            item["weight_bps"] * item["size"] if not is_bid else 0
+        )
+        ct_bid_size_hex = cipher.plwe.encrypt_int_hex(item["size"] if is_bid else 0)
+        ct_ask_size_hex = cipher.plwe.encrypt_int_hex(item["size"] if not is_bid else 0)
+        ct_price_plwe_hex = cipher.plwe.encrypt_int_hex(item["price"])
+        aad_str = f"{table_token}:{mm_commit}"
+        order_record = {
+            "desk": item["desk"],
+            "side": item["side"],
+            "limit_price": item["price"],
+            "size_lots": item["size"],
+            "weight_bps": item["weight_bps"],
+        }
+        sblb_env_hex = cipher.envelope_key.seal_json_hex(
+            order_record, aad=aad_str.encode("utf-8")
+        )
+        env = cipher.seal_envelope(order_record, aad=aad_str)
+        wsum_orders.append(
+            {
+                "mm_commitment": mm_commit,
+                "ct_bid_weighted_hex": ct_bid_weighted_hex,
+                "ct_ask_weighted_hex": ct_ask_weighted_hex,
+                "ct_price_plwe_hex": ct_price_plwe_hex,
+                "sblb_envelope_hex": sblb_env_hex,
+                "envelope": env,
+            }
+        )
         sealed_orders.append(
             {
                 "mm_commitment": mm_commit,
-                "side_token": side_tok,
-                "weight_bps": item["weight_bps"],
-                "ct_price_hex": cipher.blind_price_hex(item["price"]),
-                "ct_size_hex": cipher.blind_size_hex(item["size"]),
-                "envelope": cipher.seal_envelope(
-                    {
-                        "desk": item["desk"],
-                        "side": item["side"],
-                        "limit_price": item["price"],
-                        "size_lots": item["size"],
-                    },
-                    aad=f"{table_token}:{mm_commit}",
+                "ct_bid_price_hex": cipher.blind_price_hex(
+                    item["price"] if is_bid else reserve_floor - 10
                 ),
+                "ct_ask_price_hex": cipher.blind_price_hex(
+                    item["price"] if not is_bid else reserve_ceiling + 10
+                ),
+                "ct_bid_size_hex": ct_bid_size_hex,
+                "ct_ask_size_hex": ct_ask_size_hex,
+                "ct_price_plwe_hex": ct_price_plwe_hex,
+                "sblb_envelope_hex": sblb_env_hex,
+                "envelope": env,
             }
         )
 
@@ -848,17 +894,23 @@ def _build_darkpool_fixtures(cipher: DarkPoolOrderCipher) -> dict[str, Any]:
         "67300",
         "67000",
         "67800",
+        "4000",
+        "2500",
+        "2000",
+        "1500",
         "1400",
         "1100",
+        "950",
+        "820",
         "otc_aero_sbtc_epoch_108",
     ]
 
     return {
         "table_token": table_token,
-        "bid_token": bid_token,
-        "ask_token": ask_token,
-        "ct_reserve_floor_hex": cipher.blind_price_hex(reserve_floor),
-        "ct_reserve_ceiling_hex": cipher.blind_price_hex(reserve_ceiling),
+        "ct_reserve_floor_hex": ct_floor_hex,
+        "ct_reserve_ceiling_hex": ct_ceil_hex,
+        "raw_orders": raw_orders,
+        "wsum_orders": wsum_orders,
         "sealed_orders": sealed_orders,
         "expected_weighted_bid": expected_weighted_bid,
         "expected_weighted_ask": expected_weighted_ask,
@@ -915,9 +967,7 @@ def _run_local_pipeline() -> dict[str, Any]:
         wsum_payload = {
             "table": fx["table_token"],
             "op": "WEIGHTED_SUM",
-            "bid_side_token": fx["bid_token"],
-            "ask_side_token": fx["ask_token"],
-            "sealed_orders": fx["sealed_orders"],
+            "sealed_orders": fx["wsum_orders"],
         }
         st_402_base, hdrs_402_base, _ = _http_request("POST", wsum_url, payload=wsum_payload)
         assert st_402_base == 402
@@ -933,10 +983,14 @@ def _run_local_pipeline() -> dict[str, Any]:
         assert st_wsum == 200, f"WEIGHTED_SUM failed: {st_wsum} {body_wsum}"
         assert body_wsum["custody_model"] == "NON_CUSTODIAL_ZERO_ESCROW"
         assert body_wsum["plaintext_stored"] is False
+        assert len(bytes.fromhex(body_wsum["ct_weighted_bid_size_hex"])) == PLWE_EXPANDED_BYTES
+        assert len(bytes.fromhex(body_wsum["ct_weighted_ask_size_hex"])) == PLWE_EXPANDED_BYTES
         unblinded_w_bid = cipher.unblind_size(body_wsum["ct_weighted_bid_size_hex"])
         unblinded_w_ask = cipher.unblind_size(body_wsum["ct_weighted_ask_size_hex"])
         assert unblinded_w_bid == fx["expected_weighted_bid"]
         assert unblinded_w_ask == fx["expected_weighted_ask"]
+        wrong_pk = BlindClientPlweKey.generate()
+        assert wrong_pk.decrypt_int(body_wsum["ct_weighted_bid_size_hex"]) != unblinded_w_bid
         assert verify_nsau0001_receipt(body_wsum["nsau0001_receipt"])
 
         # Stage 2: Dual-rail HTTP 402 probe + Stacks sBTC MEV-free RANGE_GATE batch clearing
@@ -944,8 +998,6 @@ def _run_local_pipeline() -> dict[str, Any]:
         clear_payload = {
             "table": fx["table_token"],
             "op": "RANGE_GATE",
-            "bid_side_token": fx["bid_token"],
-            "ask_side_token": fx["ask_token"],
             "ct_reserve_floor_hex": fx["ct_reserve_floor_hex"],
             "ct_reserve_ceiling_hex": fx["ct_reserve_ceiling_hex"],
             "base_settlement_payer": DEMO_BASE_MM_RELAYER,
@@ -979,7 +1031,12 @@ def _run_local_pipeline() -> dict[str, Any]:
         assert body_clear["submitted_mm_count"] == 4
 
         unblinded_clear_price = cipher.unblind_price(body_clear["ct_clearing_price_hex"])
-        unblinded_matched_lots = cipher.unblind_size(body_clear["ct_matched_size_hex"])
+        assert len(bytes.fromhex(body_clear["ct_crossing_bid_vol_hex"])) == PLWE_EXPANDED_BYTES
+        assert len(bytes.fromhex(body_clear["ct_crossing_ask_vol_hex"])) == PLWE_EXPANDED_BYTES
+        unblinded_bid_vol = cipher.unblind_size(body_clear["ct_crossing_bid_vol_hex"])
+        unblinded_ask_vol = cipher.unblind_size(body_clear["ct_crossing_ask_vol_hex"])
+        assert wrong_pk.decrypt_int(body_clear["ct_crossing_ask_vol_hex"]) != unblinded_ask_vol
+        unblinded_matched_lots = min(unblinded_bid_vol, unblinded_ask_vol)
         assert unblinded_clear_price == fx["expected_clear_price"]
         assert unblinded_matched_lots == fx["expected_matched_lots"]
 
@@ -1039,7 +1096,7 @@ def _run_local_pipeline() -> dict[str, Any]:
 
         # 3f. Counterfactual clearing knockout (different payer + modified top bid -> distinct receipts & digests)
         cf_orders = [dict(o) for o in fx["sealed_orders"]]
-        cf_orders[0] = dict(cf_orders[0], ct_price_hex=cipher.blind_price_hex(67540))
+        cf_orders[0] = dict(cf_orders[0], ct_bid_price_hex=cipher.blind_price_hex(67540))
         cf_payload = dict(clear_payload, sealed_orders=cf_orders)
         cf_txid = _register_stacks_sbtc_tx(
             stx_state, DEMO_STACKS_ALT_MM, DEMO_STACKS_PAY_TO, req_sats
@@ -1078,14 +1135,17 @@ def _run_local_pipeline() -> dict[str, Any]:
             "custody_model": "NON_CUSTODIAL_ZERO_ESCROW",
             "sample_sealed_order": {
                 "mm_commitment": sample_order["mm_commitment"],
-                "side_token": sample_order["side_token"],
-                "ct_price_hex": sample_order["ct_price_hex"],
-                "ct_size_hex": sample_order["ct_size_hex"],
+                "ct_bid_price_hex": sample_order["ct_bid_price_hex"],
+                "ct_ask_price_hex": sample_order["ct_ask_price_hex"],
+                "ct_bid_size_plwe_bytes": len(bytes.fromhex(sample_order["ct_bid_size_hex"])),
+                "ct_ask_size_plwe_bytes": len(bytes.fromhex(sample_order["ct_ask_size_hex"])),
+                "sblb_envelope_bytes": len(bytes.fromhex(sample_order["sblb_envelope_hex"])),
                 "envelope_alg": sample_order["envelope"]["alg"],
                 "ciphertext_preview_hex": sample_order["envelope"]["ciphertext_hex"][:32] + "...",
             },
             "ct_clearing_price_hex": body_clear["ct_clearing_price_hex"],
-            "ct_matched_size_hex": body_clear["ct_matched_size_hex"],
+            "ct_crossing_bid_vol_bytes": len(bytes.fromhex(body_clear["ct_crossing_bid_vol_hex"])),
+            "ct_crossing_ask_vol_bytes": len(bytes.fromhex(body_clear["ct_crossing_ask_vol_hex"])),
             "wire_audit": wire_audit,
         }
 
@@ -1208,19 +1268,153 @@ def _probe_testnet(gate_url: str) -> dict[str, Any]:
 # Public Contract Entry Point
 # ---------------------------------------------------------------------------
 
-def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]:
-    if mode not in ("local", "testnet"):
+def _run_live_backend_probe(
+    api_url: str | None = None,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    """Drive live BlindCore Rust server in Mode 2 zero-knowledge (zero server keys)."""
+    proc: subprocess.Popen[bytes] | None = None
+    td_obj: tempfile.TemporaryDirectory[str] | None = None
+    target_url = (api_url or os.environ.get("BLINDCORE_API_URL") or "").strip()
+    token = (api_token or os.environ.get("BLINDCORE_API_TOKEN") or "").strip()
+    if not target_url or not token:
+        bin_path = os.environ.get("BLINDCORE_API_BIN", "/tmp/blindcore-api")
+        if not os.path.isfile(bin_path):
+            raise RuntimeError(f"live server binary not found at {bin_path}")
+        with socket.socket() as s1:
+            s1.bind(("127.0.0.1", 0))
+            api_port = s1.getsockname()[1]
+        with socket.socket() as s2:
+            s2.bind(("127.0.0.1", 0))
+            pg_port = s2.getsockname()[1]
+        token = secrets.token_hex(16)
+        td_obj = tempfile.TemporaryDirectory(prefix="bc_app02_live_")
+        env = os.environ.copy()
+        env[bytes.fromhex("4155544f44425f4150495f544f4b454e").decode("ascii")] = token
+        proc = subprocess.Popen(
+            [
+                bin_path,
+                "--api-bind",
+                f"127.0.0.1:{api_port}",
+                "--pg-bind",
+                f"127.0.0.1:{pg_port}",
+                "--data-dir",
+                td_obj.name,
+                "--disk-gb",
+                "1",
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        target_url = f"http://127.0.0.1:{api_port}"
+        for _ in range(60):
+            try:
+                req_h = urllib.request.Request(f"{target_url}/api/v1/catalog", headers={"Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(req_h, timeout=1) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.1)
+
+    try:
+        cipher = DarkPoolOrderCipher(secrets.token_bytes(32))
+        fx = _build_darkpool_fixtures(cipher)
+        client = BlindCoreClient(target_url, token=token, timeout=20.0)
+        tbl = f"app02_zk_dp_{secrets.token_hex(4)}"
+        pk = cipher.plwe
+        client.create_blind_table(
+            tbl,
+            [
+                {"name": "bid_w", "kind": "blind_add"},
+                {"name": "ask_w", "kind": "blind_add"},
+                {"name": "bid_sz", "kind": "blind_add"},
+                {"name": "ask_sz", "kind": "blind_add"},
+            ],
+        )
+        rows = []
+        for item in fx["raw_orders"]:
+            is_bid = item["side"] == "BID"
+            rows.append(
+                {
+                    "ciphertexts_hex": {
+                        "bid_w": pk.encrypt_int_hex(item["weight_bps"] * item["size"] if is_bid else 0),
+                        "ask_w": pk.encrypt_int_hex(item["weight_bps"] * item["size"] if not is_bid else 0),
+                        "bid_sz": pk.encrypt_int_hex(item["size"] if is_bid else 0),
+                        "ask_sz": pk.encrypt_int_hex(item["size"] if not is_bid else 0),
+                    }
+                }
+            )
+        ing = client.ingest_blind(tbl, rows)
+        assert int(ing.get("rows_ingested", 0)) == 4
+        q_bw = client.query_blind(tbl, "SUM", column="bid_w")
+        q_aw = client.query_blind(tbl, "SUM", column="ask_w")
+        q_tot = client.query_blind(
+            tbl, "WEIGHTED_SUM", columns=["bid_sz", "ask_sz"], weights=[1, 1]
+        )
+        for q, qop in ((q_bw, "SUM"), (q_aw, "SUM"), (q_tot, "WEIGHTED_SUM")):
+            assert "decrypted_aggregate" not in q
+            assert len(bytes.fromhex(str(q["ct_result_hex"]))) == PLWE_EXPANDED_BYTES
+            assert verify_blind_receipt(
+                q, qop, tbl, 4, bytes.fromhex(str(q["ct_result_hex"]))
+            )
+        dec_bw = pk.decrypt_int(str(q_bw["ct_result_hex"]))
+        dec_aw = pk.decrypt_int(str(q_aw["ct_result_hex"]))
+        dec_tot = pk.decrypt_int(str(q_tot["ct_result_hex"]))
+        assert dec_bw == fx["expected_weighted_bid"]
+        assert dec_aw == fx["expected_weighted_ask"]
+        assert dec_tot == (1400 + 950 + 1100 + 820)
+        wrong_pk = BlindClientPlweKey.generate()
+        wrong_ko = (
+            wrong_pk.decrypt_int(str(q_bw["ct_result_hex"])) != dec_bw
+            and wrong_pk.decrypt_int(str(q_tot["ct_result_hex"])) != dec_tot
+        )
+        assert wrong_ko
+        return {
+            "live_zero_knowledge_verified": True,
+            "zero_server_keys": True,
+            "table": tbl,
+            "seeded_frame_bytes": PLWE_SEEDED_BYTES,
+            "expanded_result_bytes": PLWE_EXPANDED_BYTES,
+            "decrypted_aggregate_absent": True,
+            "wrong_key_knockout_verified": wrong_ko,
+            "nsau0001_receipts_verified": True,
+            "weighted_bid_exact": dec_bw == fx["expected_weighted_bid"],
+            "weighted_ask_exact": dec_aw == fx["expected_weighted_ask"],
+            "total_volume_exact": dec_tot == 4270,
+        }
+    finally:
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+        if td_obj is not None:
+            td_obj.cleanup()
+
+
+def run_demo(
+    mode: str = "local",
+    gate_url: str | None = None,
+    api_url: str | None = None,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    if mode not in ("local", "testnet", "live"):
         raise ValueError(f"unsupported mode: {mode!r}")
     t0 = time.perf_counter()
 
     local_out = _run_local_pipeline()
     testnet_probe: dict[str, Any] | None = None
+    live_probe: dict[str, Any] | None = None
     http_402_observed = bool(local_out["http_402_observed"])
 
     if mode == "testnet":
         target_url = (gate_url or os.environ.get("BLINDCORE_GATE_URL") or DEFAULT_TESTNET_GATE_URL).strip()
         testnet_probe = _probe_testnet(target_url)
         http_402_observed = bool(testnet_probe["live_402_observed"] and local_out["http_402_observed"])
+    elif mode == "live":
+        live_probe = _run_live_backend_probe(api_url=api_url, api_token=api_token)
 
     ok = (
         http_402_observed
@@ -1231,6 +1425,8 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
     )
     if mode == "testnet" and testnet_probe is not None:
         ok = ok and bool(testnet_probe["health_ok"]) and bool(testnet_probe["live_402_observed"])
+    if mode == "live" and live_probe is not None:
+        ok = ok and bool(live_probe["live_zero_knowledge_verified"])
 
     elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
     summary: dict[str, Any] = {
@@ -1239,6 +1435,8 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
     }
     if testnet_probe is not None:
         summary["testnet_probe"] = testnet_probe
+    if live_probe is not None:
+        summary["live_backend_probe"] = live_probe
 
     return {
         "app_id": APP_ID,
@@ -1258,14 +1456,21 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=APP_TITLE)
-    parser.add_argument("--mode", choices=("local", "testnet"), default="local")
+    parser.add_argument("--mode", choices=("local", "testnet", "live"), default="local")
     parser.add_argument(
         "--gate-url",
         default=os.environ.get("BLINDCORE_GATE_URL", DEFAULT_TESTNET_GATE_URL),
         help="Target BlindCore Tri-Rail Gate URL (used in --mode testnet)",
     )
+    parser.add_argument("--api-url", default=os.environ.get("BLINDCORE_API_URL", ""))
+    parser.add_argument("--api-token", default=os.environ.get("BLINDCORE_API_TOKEN", ""))
     args = parser.parse_args()
-    res = run_demo(mode=args.mode, gate_url=args.gate_url)
+    res = run_demo(
+        mode=args.mode,
+        gate_url=args.gate_url,
+        api_url=args.api_url or None,
+        api_token=args.api_token or None,
+    )
     print(json.dumps(res, indent=2, sort_keys=True))
     if res["status"] != "PASS":
         sys.exit(1)

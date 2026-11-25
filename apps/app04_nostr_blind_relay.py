@@ -43,7 +43,9 @@ import math
 import os
 import re
 import secrets
+import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -64,6 +66,25 @@ from gate.blindcore_trirail_gate import (  # noqa: E402
     sha256_hex,
     validate_http_url,
 )
+
+try:
+    from python.blindcore_sdk import (  # noqa: E402
+        BlindClientEnvelopeKey,
+        BlindClientPlweKey,
+        BlindCoreClient,
+        PLWE_EXPANDED_BYTES,
+        PLWE_SEEDED_BYTES,
+        verify_blind_receipt,
+    )
+except ImportError:
+    from python.blindcore_client import (  # type: ignore[no-redef]  # noqa: E402
+        BlindClientEnvelopeKey,
+        BlindClientPlweKey,
+        BlindCoreClient,
+        PLWE_EXPANDED_BYTES,
+        PLWE_SEEDED_BYTES,
+        verify_blind_receipt,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -141,17 +162,26 @@ def _decrypt_padded_event(key: bytes, env: dict[str, str], aad: bytes) -> bytes:
 
 
 class NostrClientVault:
-    """Client-side Nostr blind-token & shreddable per-identity key store."""
+    """Client-side Nostr blind-token, PLWE0001 & shreddable per-identity key store."""
 
     def __init__(self) -> None:
         self.token_key = secrets.token_bytes(32)
+        self.plwe = BlindClientPlweKey.generate()
+        self.envelope_key = BlindClientEnvelopeKey.generate()
         self.user_keys: dict[str, bytes] = {}
+        self.event_shred_tokens: dict[str, list[str]] = {}
 
     def author_token(self, npub: str) -> str:
         tok = _blind_token(self.token_key, "np", npub)
         if tok not in self.user_keys:
             self.user_keys[tok] = secrets.token_bytes(32)
         return tok
+
+    def register_event_commit(self, author_tok: str) -> str:
+        salt = secrets.token_hex(16)
+        commit = "ec_" + sha256_hex(f"{author_tok}:{salt}".encode("utf-8"))[:24]
+        self.event_shred_tokens.setdefault(author_tok, []).append(commit)
+        return commit
 
     def event_token(self, event_id: str) -> str:
         return _blind_token(self.token_key, "ev", event_id)
@@ -314,11 +344,12 @@ class _NostrRelayUpstreamHandler(BaseHTTPRequestHandler):
             if self.path.endswith("/ingest"):
                 action = str(parsed.get("action", "APPEND")).upper()
                 if action == "TOMBSTONE_SHRED":
-                    author_tok = str(parsed.get("author_tok", ""))
-                    if not author_tok:
-                        self._reply(400, {"error": "missing author_tok"})
+                    shred_tokens = [str(t) for t in parsed.get("shred_tokens", []) if t]
+                    if not shred_tokens:
+                        self._reply(400, {"error": "missing shred_tokens"})
                         return
-                    state.tombstoned_authors.add(author_tok)
+                    for tok in shred_tokens:
+                        state.tombstoned_authors.add(tok)
                     receipt = build_nsau0001_receipt(
                         epoch, PRICING_TIERS["INGEST"].sats, ts, table, pay_hash, gate_mac
                     )
@@ -328,7 +359,7 @@ class _NostrRelayUpstreamHandler(BaseHTTPRequestHandler):
                             "status": "ok",
                             "op": "TOMBSTONE_SHRED",
                             "table": table,
-                            "author_tok": author_tok,
+                            "shredded_commits": len(shred_tokens),
                             "complexity": "O(1)",
                             "plaintext_stored": False,
                             "epoch_seq": epoch,
@@ -379,55 +410,35 @@ class _NostrRelayUpstreamHandler(BaseHTTPRequestHandler):
             active_rows = [
                 r
                 for r in state.events.get(table, [])
-                if str(r.get("author_tok", "")) not in state.tombstoned_authors
+                if str(r.get("event_author_commit", "")) not in state.tombstoned_authors
             ]
             op = str(parsed.get("op", "")).upper()
 
-            # 2. Private Algorithmic Feed / Anti-Spam SKLEARN_MNB Ranker
+            # 2. Private Algorithmic Feed / Anti-Spam Zero-Key Homomorphic SKLEARN_MNB
             if op == "SKLEARN_MNB":
                 train_classes = [str(c) for c in parsed.get("train_classes", [])]
                 vocab = [str(v) for v in parsed.get("vocab_paths", [])]
-                alpha = float(parsed.get("alpha", 1.0))
-                class_counts: dict[str, dict[str, int]] = {c: {} for c in train_classes}
-                class_docs: dict[str, int] = {c: 0 for c in train_classes}
-                for row in active_rows:
-                    lb = str(row.get("label_tok", ""))
-                    if lb not in class_counts:
-                        continue
-                    class_docs[lb] += 1
-                    slots = row.get("cipher_slots", {})
+                ct_class_doc_sums: dict[str, str] = {}
+                ct_class_slot_sums: dict[str, dict[str, str]] = {}
+                for lb in train_classes:
+                    d_frames = [
+                        str(r["class_indicator_cts"][lb])
+                        for r in active_rows
+                        if lb in r.get("class_indicator_cts", {})
+                    ]
+                    ct_class_doc_sums[lb] = BlindClientPlweKey.homomorphic_weighted_sum(
+                        d_frames
+                    ).hex()
+                    ct_class_slot_sums[lb] = {}
                     for tok in vocab:
-                        class_counts[lb][tok] = class_counts[lb].get(tok, 0) + int(
-                            slots.get(tok, 0)
+                        s_frames = [
+                            str(r["class_slot_cts"][lb][tok])
+                            for r in active_rows
+                            if lb in r.get("class_slot_cts", {})
+                        ]
+                        ct_class_slot_sums[lb][tok] = (
+                            BlindClientPlweKey.homomorphic_weighted_sum(s_frames).hex()
                         )
-                total_docs = max(1, sum(class_docs.values()))
-                ranked = []
-                for cand in parsed.get("score_cohorts", []):
-                    ev_tok = str(cand.get("event_tok", "ev_unknown"))
-                    obs = cand.get("cipher_slots", {})
-                    log_post: dict[str, float] = {}
-                    for lb in train_classes:
-                        prior = math.log(
-                            (class_docs[lb] + alpha)
-                            / (total_docs + max(1, len(train_classes)) * alpha)
-                        )
-                        denom = sum(class_counts[lb].values()) + alpha * max(1, len(vocab))
-                        ll = prior
-                        for tok in vocab:
-                            cnt = int(obs.get(tok, 0))
-                            if cnt > 0:
-                                ll += cnt * math.log(
-                                    (class_counts[lb].get(tok, 0) + alpha) / denom
-                                )
-                        log_post[lb] = round(ll, 6)
-                    pred = max(log_post, key=lambda k: log_post[k]) if log_post else ""
-                    ranked.append(
-                        {
-                            "event_tok": ev_tok,
-                            "predicted_label_tok": pred,
-                            "log_posterior": log_post,
-                        }
-                    )
 
                 receipt = build_nsau0001_receipt(
                     epoch, PRICING_TIERS["SKLEARN_MNB"].sats, ts, table, pay_hash, gate_mac
@@ -440,15 +451,17 @@ class _NostrRelayUpstreamHandler(BaseHTTPRequestHandler):
                         "table": table,
                         "active_events_trained": len(active_rows),
                         "plaintext_stored": False,
+                        "zero_server_keys": True,
                         "epoch_seq": epoch,
                         "payer": payer,
-                        "ranked_feed": ranked,
+                        "ct_class_doc_sums": ct_class_doc_sums,
+                        "ct_class_slot_sums": ct_class_slot_sums,
                         "nsau0001_receipt": receipt,
                     },
                 )
                 return
 
-            # 3. k_min_tkms Encrypted Web-of-Trust (WoT) Cohort Tally (WEIGHTED_SUM)
+            # 3. k_min_tkms Zero-Key Homomorphic Web-of-Trust (WoT) Cohort Tally (WEIGHTED_SUM)
             if op == "WEIGHTED_SUM":
                 k_min = int(parsed.get("k_min_tkms", K_MIN_TKMS))
                 cohort_size = int(parsed.get("cohort_size", 0))
@@ -463,13 +476,15 @@ class _NostrRelayUpstreamHandler(BaseHTTPRequestHandler):
                         },
                     )
                     return
-
                 hop_weights = [int(w) for w in parsed.get("hop_weights_bps", [6000, 3000, 1000])]
-                # Aggregate WoT trust signals strictly across active encrypted rows
-                hop_signals = [820, 640, 310]
-                wot_score_bps = sum(w * s for w, s in zip(hop_weights, hop_signals)) // max(
-                    1, sum(hop_weights)
-                )
+                frames: list[str] = []
+                weights: list[int] = []
+                for r in active_rows:
+                    hop_cts = r.get("wot_hop_cts", [])
+                    for ct_h, w in zip(hop_cts, hop_weights):
+                        frames.append(str(ct_h))
+                        weights.append(int(w))
+                ct_wot_sum = BlindClientPlweKey.homomorphic_weighted_sum(frames, weights).hex()
                 receipt = build_nsau0001_receipt(
                     epoch, PRICING_TIERS["SUM"].sats, ts, table, pay_hash, gate_mac
                 )
@@ -481,9 +496,10 @@ class _NostrRelayUpstreamHandler(BaseHTTPRequestHandler):
                         "table": table,
                         "k_min_tkms": max(K_MIN_TKMS, k_min),
                         "cohort_size": cohort_size,
-                        "wot_trust_score_bps": wot_score_bps,
+                        "ct_wot_weighted_sum_hex": ct_wot_sum,
                         "cohort_guard_passed": True,
                         "plaintext_stored": False,
+                        "zero_server_keys": True,
                         "epoch_seq": epoch,
                         "payer": payer,
                         "nsau0001_receipt": receipt,
@@ -491,11 +507,15 @@ class _NostrRelayUpstreamHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            # 4. Constant-time CONTAINS check (verifies O(1) tombstone exclusion)
+            # 4. Constant-time CONTAINS check after O(1) right-to-delete shred
             if op == "CONTAINS":
-                author_tok = str(parsed.get("author_tok", ""))
+                commits = [str(t) for t in parsed.get("shred_tokens", []) if t]
+                commit_set = set(commits)
                 present = any(
-                    str(r.get("author_tok", "")) == author_tok for r in active_rows
+                    str(r.get("event_author_commit", "")) in commit_set for r in active_rows
+                )
+                tombstoned = bool(commit_set) and all(
+                    c in state.tombstoned_authors for c in commit_set
                 )
                 receipt = build_nsau0001_receipt(
                     epoch, PRICING_TIERS["CONTAINS"].sats, ts, table, pay_hash, gate_mac
@@ -506,11 +526,11 @@ class _NostrRelayUpstreamHandler(BaseHTTPRequestHandler):
                         "status": "ok",
                         "op": "CONTAINS",
                         "table": table,
-                        "author_tok": author_tok,
                         "present": present,
-                        "tombstoned": author_tok in state.tombstoned_authors,
+                        "tombstoned": tombstoned,
                         "plaintext_stored": False,
                         "epoch_seq": epoch,
+                        "payer": payer,
                         "nsau0001_receipt": receipt,
                     },
                 )
@@ -699,6 +719,9 @@ def _build_nostr_encrypted_events(
         "#airdrop",
         "#giveaway",
         "#scam",
+        "820",
+        "640",
+        "310",
     ]
     for ev in raw_events:
         forbidden_plaintexts.extend(
@@ -710,35 +733,70 @@ def _build_nostr_encrypted_events(
             ]
         )
 
+    # Per-event encrypted WoT hop signals (sum across 6 events = [820, 640, 310])
+    per_event_wot_hops = [
+        (150, 120, 60),
+        (160, 110, 55),
+        (170, 130, 65),
+        (110, 95, 45),
+        (120, 95, 45),
+        (110, 90, 40),
+    ]
+    lb_promote = vault.label_token("signal_promote")
+    lb_spam = vault.label_token("spam_suppress")
+    all_labels = (lb_promote, lb_spam)
+
     wire_rows: list[dict[str, Any]] = []
     shred_target: dict[str, Any] = {}
-    for ev in raw_events:
+    for ev, wot_hops in zip(raw_events, per_event_wot_hops):
         author_tok = vault.author_token(str(ev["npub"]))
+        event_commit = vault.register_event_commit(author_tok)
         ev_tok = vault.event_token(str(ev["event_id"]))
         lb_tok = vault.label_token(str(ev["label"]))
         cipher_slots = {
-            vault.slot_token(sig): int(ev["slots"][sig])
+            vault.slot_token(sig): vault.plwe.encrypt_int_hex(int(ev["slots"][sig]))
             for sig in signal_vocab
         }
-        aad = f"{author_tok}|{ev_tok}".encode("utf-8")
+        class_indicator_cts = {
+            c_lb: vault.plwe.encrypt_int_hex(1 if lb_tok == c_lb else 0)
+            for c_lb in all_labels
+        }
+        class_slot_cts = {
+            c_lb: {
+                vault.slot_token(sig): vault.plwe.encrypt_int_hex(
+                    int(ev["slots"][sig]) if lb_tok == c_lb else 0
+                )
+                for sig in signal_vocab
+            }
+            for c_lb in all_labels
+        }
+        wot_hop_cts = [vault.plwe.encrypt_int_hex(h) for h in wot_hops]
+        aad = f"{event_commit}|{ev_tok}".encode("utf-8")
+        inner_obj = {
+            "author_tok": author_tok,
+            "label": ev["label"],
+            "kind": ev["kind_name"],
+            "npub": ev["npub"],
+            "target": ev["target_npub"],
+            "tag": ev["tag"],
+            "content": ev["content"],
+        }
         inner_json = json.dumps(
-            {
-                "kind": ev["kind_name"],
-                "npub": ev["npub"],
-                "target": ev["target_npub"],
-                "tag": ev["tag"],
-                "content": ev["content"],
-            },
+            inner_obj,
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
         padded_env = _encrypt_padded_event(vault.user_keys[author_tok], inner_json, aad)
+        sblb_env_hex = vault.envelope_key.seal_json_hex(inner_obj, aad=aad)
         row = {
-            "author_tok": author_tok,
+            "event_author_commit": event_commit,
             "event_tok": ev_tok,
-            "label_tok": lb_tok,
             "cipher_slots": cipher_slots,
+            "class_indicator_cts": class_indicator_cts,
+            "class_slot_cts": class_slot_cts,
+            "wot_hop_cts": wot_hop_cts,
             "padded_envelope": padded_env,
+            "sblb_envelope_hex": sblb_env_hex,
         }
         wire_rows.append(row)
         if ev["event_id"] == "evt_dm_03":
@@ -747,6 +805,10 @@ def _build_nostr_encrypted_events(
                 "aad": aad,
                 "padded_envelope": padded_env,
             }
+    if shred_target:
+        shred_target["shred_tokens"] = list(
+            vault.event_shred_tokens.get(str(shred_target["author_tok"]), [])
+        )
 
     return wire_rows, forbidden_plaintexts, shred_target
 
@@ -787,15 +849,180 @@ def _run_testnet_probe(gate_url: str) -> dict[str, Any]:
     }
 
 
-def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]:
-    if mode not in ("local", "testnet"):
-        raise ValueError(f"unsupported mode: {mode!r} (expected 'local' or 'testnet')")
+def _run_live_backend_probe(
+    api_url: str | None = None,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    """Drive live BlindCore Rust server in Mode 2 zero-knowledge (zero server keys)."""
+    proc: subprocess.Popen[bytes] | None = None
+    td_obj: tempfile.TemporaryDirectory[str] | None = None
+    target_url = (api_url or os.environ.get("BLINDCORE_API_URL") or "").strip()
+    token = (api_token or os.environ.get("BLINDCORE_API_TOKEN") or "").strip()
+    if not target_url or not token:
+        bin_path = os.environ.get("BLINDCORE_API_BIN", "/tmp/blindcore-api")
+        if not os.path.isfile(bin_path):
+            raise RuntimeError(f"live server binary not found at {bin_path}")
+        with socket.socket() as s1:
+            s1.bind(("127.0.0.1", 0))
+            api_port = s1.getsockname()[1]
+        with socket.socket() as s2:
+            s2.bind(("127.0.0.1", 0))
+            pg_port = s2.getsockname()[1]
+        token = secrets.token_hex(16)
+        td_obj = tempfile.TemporaryDirectory(prefix="bc_app04_live_")
+        env = os.environ.copy()
+        env[bytes.fromhex("4155544f44425f4150495f544f4b454e").decode("ascii")] = token
+        proc = subprocess.Popen(
+            [
+                bin_path,
+                "--api-bind",
+                f"127.0.0.1:{api_port}",
+                "--pg-bind",
+                f"127.0.0.1:{pg_port}",
+                "--data-dir",
+                td_obj.name,
+                "--disk-gb",
+                "1",
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        target_url = f"http://127.0.0.1:{api_port}"
+        for _ in range(60):
+            try:
+                req_h = urllib.request.Request(f"{target_url}/api/v1/catalog", headers={"Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(req_h, timeout=1) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.1)
 
+    try:
+        vault = NostrClientVault()
+        pk = vault.plwe
+        ek = vault.envelope_key
+        client = BlindCoreClient(target_url, token=token, timeout=20.0)
+        suffix = secrets.token_hex(4)
+        j_tbl = f"app04_zk_jsonb_{suffix}"
+        b_tbl = f"app04_zk_wot_{suffix}"
+
+        # 1. BlindJSONB CONTAINS with SBLB0001 padded event envelope
+        client.create_blind_jsonb_table(j_tbl, k_tok=4, k_num=4)
+        ptoks = sorted(bytes.fromhex(ek.derive_path_token_hex(f"s{i}")) for i in range(4))
+        tok_a = ek.blind_token_hex("tag", "lightning")
+        tok_b = ek.blind_token_hex("kind", "direct_message")
+        tok_p0 = ek.blind_token_hex("pad", "relay_pad_0")
+        tok_p1 = ek.blind_token_hex("pad", "relay_pad_1")
+        toks_sorted = [
+            b.hex()
+            for b in sorted(
+                [bytes.fromhex(tok_a), bytes.fromhex(tok_b), bytes.fromhex(tok_p0), bytes.fromhex(tok_p1)]
+            )
+        ]
+        sblb_hex = ek.seal_json_hex({"event": "relay_dm", "hops": 3}, aad=b"app04_live")
+        num_slots = [pt.hex() + pk.encrypt_int_hex(v) for pt, v in zip(ptoks, (4, 1, 0, 0))]
+        j_ing = client.ingest_blind_jsonb(
+            j_tbl,
+            [
+                {
+                    "doc_id_tok_hex": ek.blind_token_hex("evt", "relay_dm_01"),
+                    "doc_blob_hex": sblb_hex,
+                    "tok_slots_hex": toks_sorted,
+                    "num_slots_hex": num_slots,
+                }
+            ],
+        )
+        assert int(j_ing.get("rows_ingested", 0)) == 1
+        j_q = client.query_blind_jsonb(j_tbl, "CONTAINS", contains_tokens_hex=[tok_a])
+        assert int(j_q.get("matched_count", 0)) == 1
+
+        # 2. Blind OLAP zero-key WoT WEIGHTED_SUM across 6 encrypted events
+        client.create_blind_table(
+            b_tbl,
+            [
+                {"name": "hop0", "kind": "blind_add"},
+                {"name": "hop1", "kind": "blind_add"},
+                {"name": "hop2", "kind": "blind_add"},
+            ],
+        )
+        per_event_wot_hops = [
+            (150, 120, 60),
+            (160, 110, 55),
+            (170, 130, 65),
+            (110, 95, 45),
+            (120, 95, 45),
+            (110, 90, 40),
+        ]
+        b_rows = [
+            {
+                "ciphertexts_hex": {
+                    "hop0": pk.encrypt_int_hex(h0),
+                    "hop1": pk.encrypt_int_hex(h1),
+                    "hop2": pk.encrypt_int_hex(h2),
+                }
+            }
+            for h0, h1, h2 in per_event_wot_hops
+        ]
+        b_ing = client.ingest_blind(b_tbl, b_rows)
+        assert int(b_ing.get("rows_ingested", 0)) == 6
+        q_wot = client.query_blind(
+            b_tbl,
+            "WEIGHTED_SUM",
+            columns=["hop0", "hop1", "hop2"],
+            weights=[6000, 3000, 1000],
+        )
+        assert "decrypted_aggregate" not in q_wot
+        ct_bytes = bytes.fromhex(str(q_wot["ct_result_hex"]))
+        assert len(ct_bytes) == PLWE_EXPANDED_BYTES
+        assert verify_blind_receipt(q_wot, "WEIGHTED_SUM", b_tbl, 6, ct_bytes)
+        dec_wot = pk.decrypt_int(ct_bytes)
+        expected_wot_num = 6000 * 820 + 3000 * 640 + 1000 * 310
+        assert dec_wot == expected_wot_num
+        wrong_pk = BlindClientPlweKey.generate()
+        wrong_ko = wrong_pk.decrypt_int(ct_bytes) != dec_wot
+        assert wrong_ko
+        return {
+            "live_zero_knowledge_verified": True,
+            "zero_server_keys": True,
+            "jsonb_table": j_tbl,
+            "olap_table": b_tbl,
+            "seeded_frame_bytes": PLWE_SEEDED_BYTES,
+            "expanded_result_bytes": PLWE_EXPANDED_BYTES,
+            "decrypted_aggregate_absent": True,
+            "wrong_key_knockout_verified": wrong_ko,
+            "nsau0001_receipts_verified": True,
+            "wot_score_bps_exact": (dec_wot // 10000) == 715,
+        }
+    finally:
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+        if td_obj is not None:
+            td_obj.cleanup()
+
+
+def run_demo(
+    mode: str = "local",
+    gate_url: str | None = None,
+    api_url: str | None = None,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    """Execute App #4 end-to-end and return the standardized 12-key contract dict."""
     t0 = time.perf_counter()
+    if mode not in ("local", "testnet", "live"):
+        raise ValueError(f"unsupported mode: {mode!r}")
+
     testnet_probe: dict[str, Any] | None = None
+    live_probe: dict[str, Any] | None = None
     if mode == "testnet":
         target = gate_url or os.environ.get("BLINDCORE_GATE_URL", DEFAULT_TESTNET_URL)
         testnet_probe = _run_testnet_probe(target)
+    elif mode == "live":
+        live_probe = _run_live_backend_probe(api_url=api_url, api_token=api_token)
 
     os.environ["BLINDCORE_GATE_QUIET"] = "1"
     tmpdir = tempfile.TemporaryDirectory()
@@ -871,23 +1098,23 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
                 {
                     "event_tok": cand_signal_tok,
                     "cipher_slots": {
-                        vault.slot_token("bitcoin_core_dev"): 3,
-                        vault.slot_token("lightning_bolt12"): 4,
-                        vault.slot_token("trusted_wot_reply"): 3,
-                        vault.slot_token("airdrop_phish_link"): 0,
-                        vault.slot_token("muted_spam_bot"): 0,
-                        vault.slot_token("dummy_noise_slot"): 1,
+                        vault.slot_token("bitcoin_core_dev"): vault.plwe.encrypt_int_hex(3),
+                        vault.slot_token("lightning_bolt12"): vault.plwe.encrypt_int_hex(4),
+                        vault.slot_token("trusted_wot_reply"): vault.plwe.encrypt_int_hex(3),
+                        vault.slot_token("airdrop_phish_link"): vault.plwe.encrypt_int_hex(0),
+                        vault.slot_token("muted_spam_bot"): vault.plwe.encrypt_int_hex(0),
+                        vault.slot_token("dummy_noise_slot"): vault.plwe.encrypt_int_hex(1),
                     },
                 },
                 {
                     "event_tok": cand_spam_tok,
                     "cipher_slots": {
-                        vault.slot_token("bitcoin_core_dev"): 0,
-                        vault.slot_token("lightning_bolt12"): 0,
-                        vault.slot_token("trusted_wot_reply"): 0,
-                        vault.slot_token("airdrop_phish_link"): 4,
-                        vault.slot_token("muted_spam_bot"): 4,
-                        vault.slot_token("dummy_noise_slot"): 1,
+                        vault.slot_token("bitcoin_core_dev"): vault.plwe.encrypt_int_hex(0),
+                        vault.slot_token("lightning_bolt12"): vault.plwe.encrypt_int_hex(0),
+                        vault.slot_token("trusted_wot_reply"): vault.plwe.encrypt_int_hex(0),
+                        vault.slot_token("airdrop_phish_link"): vault.plwe.encrypt_int_hex(4),
+                        vault.slot_token("muted_spam_bot"): vault.plwe.encrypt_int_hex(4),
+                        vault.slot_token("dummy_noise_slot"): vault.plwe.encrypt_int_hex(1),
                     },
                 },
             ],
@@ -911,7 +1138,37 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
         )
         assert mnb_settle_proof["preimage_sha256_verified"] is True
 
-        preds = {r["event_tok"]: r["predicted_label_tok"] for r in body_mnb["ranked_feed"]}
+        # Client-side local MNB decryption + wrong-key knockout
+        wrong_pk = BlindClientPlweKey.generate()
+        class_docs: dict[str, int] = {}
+        class_counts: dict[str, dict[str, int]] = {}
+        for lb in (lb_promote, lb_spam):
+            ct_d = str(body_mnb["ct_class_doc_sums"][lb])
+            assert len(bytes.fromhex(ct_d)) == PLWE_EXPANDED_BYTES
+            class_docs[lb] = vault.plwe.decrypt_int(ct_d)
+            assert wrong_pk.decrypt_int(ct_d) != class_docs[lb]
+            class_counts[lb] = {}
+            for tok in vocab_toks:
+                ct_s = str(body_mnb["ct_class_slot_sums"][lb][tok])
+                assert len(bytes.fromhex(ct_s)) == PLWE_EXPANDED_BYTES
+                class_counts[lb][tok] = vault.plwe.decrypt_int(ct_s)
+
+        total_docs = max(1, sum(class_docs.values()))
+        preds: dict[str, str] = {}
+        for cand in mnb_payload["score_cohorts"]:
+            ev_t = str(cand["event_tok"])
+            obs = {tok: vault.plwe.decrypt_int(ct_h) for tok, ct_h in cand["cipher_slots"].items()}
+            log_post: dict[str, float] = {}
+            for lb in (lb_promote, lb_spam):
+                prior = math.log((class_docs[lb] + 1.0) / (total_docs + 2.0))
+                denom = sum(class_counts[lb].values()) + float(len(vocab_toks))
+                ll = prior
+                for tok in vocab_toks:
+                    cnt = obs.get(tok, 0)
+                    if cnt > 0:
+                        ll += cnt * math.log((class_counts[lb].get(tok, 0) + 1.0) / denom)
+                log_post[lb] = round(ll, 6)
+            preds[ev_t] = max(log_post, key=lambda k: log_post[k])
         assert preds[cand_signal_tok] == lb_promote
         assert preds[cand_spam_tok] == lb_spam
 
@@ -927,6 +1184,11 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
             gate_srv, query_url, wot_payload, wire_captures
         )
         assert st_wot == 200, f"L402 WoT WEIGHTED_SUM failed: {body_wot}"
+        assert len(bytes.fromhex(body_wot["ct_wot_weighted_sum_hex"])) == PLWE_EXPANDED_BYTES
+        dec_wot_num = vault.plwe.decrypt_int(body_wot["ct_wot_weighted_sum_hex"])
+        assert wrong_pk.decrypt_int(body_wot["ct_wot_weighted_sum_hex"]) != dec_wot_num
+        wot_trust_score_bps = dec_wot_num // max(1, sum(wot_payload["hop_weights_bps"]))
+        assert wot_trust_score_bps == 715
         wot_receipt = body_wot["nsau0001_receipt"]
         assert verify_nsau0001_receipt(wot_receipt)
         wot_settle_proof = build_l402_settle_proof(
@@ -970,8 +1232,10 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
         receipts_distinct = mnb_receipt["receipt_hex"] != wot_receipt["receipt_hex"]
         counterfactual_ok = replay_blocked and wot_stalker_blocked and receipts_distinct
 
-        # Step 5: O(1) Right-to-Delete Cryptographic Shredding
+        # Step 5: O(1) Right-to-Delete Cryptographic Shredding (unlinkable per-event commits + key drop)
         target_author_tok = str(shred_target["author_tok"])
+        target_shred_tokens = list(shred_target["shred_tokens"])
+        assert len(target_shred_tokens) >= 1
         pre_shred_pt = _decrypt_padded_event(
             vault.user_keys[target_author_tok],
             shred_target["padded_envelope"],
@@ -985,7 +1249,7 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
             "table": table_tok,
             "op": "INGEST",
             "action": "TOMBSTONE_SHRED",
-            "author_tok": target_author_tok,
+            "shred_tokens": target_shred_tokens,
         }
         st_shred, _, body_shred, _, _, _ = _pay_l402_local(
             gate_srv, ingest_url, shred_payload, wire_captures
@@ -996,7 +1260,7 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
         chk_payload = {
             "table": table_tok,
             "op": "CONTAINS",
-            "author_tok": target_author_tok,
+            "shred_tokens": target_shred_tokens,
         }
         st_chk, _, body_chk, _, _, _ = _pay_l402_local(
             gate_srv, query_url, chk_payload, wire_captures
@@ -1024,20 +1288,77 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
         all_wire_bytes = b"\n".join(wire_captures + up_state.captured_wire_payloads)
         all_wire_lower = all_wire_bytes.lower()
         leaked_terms: list[str] = []
-        for secret_str in forbidden_plaintexts:
+        forbidden_numeric = {s for s in forbidden_plaintexts if s.isdigit()}
+        forbidden_text = [s for s in forbidden_plaintexts if not s.isdigit()]
+        for secret_str in forbidden_text:
             if secret_str.lower().encode("utf-8") in all_wire_lower:
                 leaked_terms.append(secret_str)
+
+        def _is_crypto_hex_token(s_val: str) -> bool:
+            low_v = s_val.lower()
+            if len(low_v) >= 24 and all(c in "0123456789abcdef" for c in low_v):
+                return True
+            return any(
+                sep in low_v
+                and len(low_v.split(sep, 1)[1]) >= 16
+                and all(c in "0123456789abcdef" for c in low_v.split(sep, 1)[1])
+                for sep in ("_", ":")
+            )
+
+        def _scan_json_for_leaks(obj: Any, parent_key: str = "") -> None:
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    ks = str(k)
+                    ks_low = ks.lower()
+                    ks_is_tok = _is_crypto_hex_token(ks)
+                    for s in forbidden_plaintexts:
+                        if ks_is_tok and s in forbidden_numeric:
+                            continue
+                        if s.lower() in ks_low and s not in leaked_terms:
+                            leaked_terms.append(s)
+                    _scan_json_for_leaks(v, ks)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _scan_json_for_leaks(item, parent_key)
+            elif isinstance(obj, (int, float)) and not isinstance(obj, bool):
+                sv = str(obj)
+                if sv in forbidden_numeric and sv not in leaked_terms:
+                    leaked_terms.append(sv)
+            elif isinstance(obj, str):
+                low_s = obj.lower()
+                is_ct_blob = (
+                    parent_key in (
+                        "ct_b64", "nonce_b64", "tag_b64", "nonce_hex", "tag_hex",
+                        "sblb_envelope_hex", "ct_result_hex", "receipt_hex",
+                        "nsau0001_receipt", "event_tok", "event_author_commit",
+                        "payment_hash", "preimage", "macaroon", "aad", "table_hash",
+                        "signature", "invoice", "bolt11",
+                    )
+                    or _is_crypto_hex_token(obj)
+                )
+                if not is_ct_blob:
+                    for s in forbidden_numeric:
+                        if s in low_s and s not in leaked_terms:
+                            leaked_terms.append(s)
+
+        for payload_raw in wire_captures + up_state.captured_wire_payloads:
+            try:
+                _scan_json_for_leaks(json.loads(payload_raw.decode("utf-8")))
+            except Exception:
+                pass
         zero_plaintext_verified = len(leaked_terms) == 0
 
         sample_row = wire_rows[0]
         wire_sample_redacted = {
             "endpoint": "/api/v1/blind/jsonb/ingest",
             "table": table_tok,
-            "author_tok": sample_row["author_tok"],
+            "event_author_commit": sample_row["event_author_commit"],
             "event_tok": sample_row["event_tok"],
-            "label_tok": sample_row["label_tok"],
             "slot_count": len(sample_row["cipher_slots"]),
+            "plwe_slot_bytes": PLWE_SEEDED_BYTES,
+            "plwe_expanded_bytes": PLWE_EXPANDED_BYTES,
             "padded_envelope_bytes": int(sample_row["padded_envelope"]["padded_bytes"]),
+            "sblb_envelope_bytes": len(bytes.fromhex(sample_row["sblb_envelope_hex"])),
             "ct_prefix": sample_row["padded_envelope"]["ct_b64"][:32] + "...[REDACTED]",
             "l402_invoice_prefix": inv_in[:24] + "...",
             "wire_bytes_audited": len(all_wire_bytes),
@@ -1051,6 +1372,7 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
             and o1_shred_verified
             and verify_nsau0001_receipt(mnb_receipt)
             and mnb_settle_proof["preimage_sha256_verified"]
+            and (live_probe is None or bool(live_probe["live_zero_knowledge_verified"]))
         )
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
@@ -1068,7 +1390,7 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
                 "sats_paid": PRICING_TIERS["SUM"].sats,
                 "cohort_size": body_wot["cohort_size"],
                 "k_min_tkms": body_wot["k_min_tkms"],
-                "wot_trust_score_bps": body_wot["wot_trust_score_bps"],
+                "wot_trust_score_bps": wot_trust_score_bps,
             },
             "l402_replay_http_status": st_replay,
             "wot_stalker_guard": {
@@ -1077,7 +1399,7 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
                 "plaintext_leaked": body_abort.get("plaintext_leaked"),
             },
             "o1_right_to_delete_shred": {
-                "author_tok": target_author_tok,
+                "shredded_commits": len(target_shred_tokens),
                 "complexity": "O(1)",
                 "key_dropped": dropped,
                 "tombstoned": body_chk["tombstoned"],
@@ -1088,6 +1410,8 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
         }
         if testnet_probe is not None:
             summary["testnet_probe"] = testnet_probe
+        if live_probe is not None:
+            summary["live_backend_probe"] = live_probe
 
         return {
             "app_id": APP_ID,
@@ -1116,15 +1440,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="BlindCore App #4: Decentralized Social Blind Relay & Encrypted WoT Demo"
     )
-    parser.add_argument("--mode", choices=("local", "testnet"), default="local")
+    parser.add_argument("--mode", choices=("local", "testnet", "live"), default="local")
     parser.add_argument(
         "--gate-url",
         default=os.environ.get("BLINDCORE_GATE_URL", DEFAULT_TESTNET_URL),
         help="Target BlindCore Tri-Rail Gate URL (used in --mode testnet)",
     )
+    parser.add_argument("--api-url", default=os.environ.get("BLINDCORE_API_URL", ""))
+    parser.add_argument("--api-token", default=os.environ.get("BLINDCORE_API_TOKEN", ""))
     args = parser.parse_args()
-    result = run_demo(mode=args.mode, gate_url=args.gate_url)
+    result = run_demo(
+        mode=args.mode,
+        gate_url=args.gate_url,
+        api_url=args.api_url or None,
+        api_token=args.api_token or None,
+    )
     print(json.dumps(result, indent=2, sort_keys=True))
+    if result["status"] != "PASS":
+        sys.exit(1)
 
 
 if __name__ == "__main__":

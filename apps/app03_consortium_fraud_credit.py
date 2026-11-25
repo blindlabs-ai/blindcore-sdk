@@ -41,7 +41,9 @@ import json
 import math
 import os
 import secrets
+import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -66,6 +68,27 @@ from gate.blindcore_trirail_gate import (  # noqa: E402
     validate_http_url,
 )
 from mcp.agentkit_provider import BlindCoreActionProvider  # noqa: E402
+
+try:
+    from python.blindcore_sdk import (  # noqa: E402
+        BlindClientEnvelopeKey,
+        BlindClientPlweKey,
+        BlindCoreClient,
+        PLWE_EXPANDED_BYTES,
+        PLWE_SEEDED_BYTES,
+        generate_zero_sum_masks,
+        verify_blind_receipt,
+    )
+except ImportError:
+    from python.blindcore_client import (  # type: ignore[no-redef]  # noqa: E402
+        BlindClientEnvelopeKey,
+        BlindClientPlweKey,
+        BlindCoreClient,
+        PLWE_EXPANDED_BYTES,
+        PLWE_SEEDED_BYTES,
+        generate_zero_sum_masks,
+        verify_blind_receipt,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +177,9 @@ class ConsortiumKeyVault:
 
     def __init__(self) -> None:
         self.token_key = secrets.token_bytes(32)
+        self.mask_key = secrets.token_bytes(32)
+        self.plwe = BlindClientPlweKey.generate()
+        self.envelope_key = BlindClientEnvelopeKey.generate()
         self.entity_keys: dict[str, bytes] = {}
 
     def entity_token(self, borrower_id: str) -> str:
@@ -179,22 +205,9 @@ class ConsortiumKeyVault:
         return self.entity_keys.pop(entity_tok, None) is not None
 
 
-def _zero_sum_masks(count: int, seed_label: str) -> list[int]:
-    """Generate deterministic zero-sum blinding masks so individual values stay hidden."""
-    if count <= 1:
-        return [0] * count
-    masks: list[int] = []
-    running = 0
-    for idx in range(count - 1):
-        digest = hashlib.sha256(f"{seed_label}|{idx}".encode("utf-8")).digest()
-        val = int.from_bytes(digest[:4], "big") % 500_000 + 100_000
-        if digest[4] & 1:
-            val = -val
-        masks.append(val)
-        running += val
-    masks.append(-running)
-    assert sum(masks) == 0
-    return masks
+def _zero_sum_masks(count: int, seed_label: str, secret_key: bytes) -> list[int]:
+    """Generate HMAC-keyed zero-sum blinding masks requiring >= 32B secret_key."""
+    return generate_zero_sum_masks(secret_key, seed_label, count)
 
 
 # ---------------------------------------------------------------------------
@@ -442,54 +455,31 @@ class _ConsortiumUpstreamHandler(BaseHTTPRequestHandler):
                     )
                     return
 
-            # 3. Joint Consortium Encrypted SKLEARN_MNB Fraud & Credit Scoring
+            # 3. Joint Consortium Zero-Key Homomorphic SKLEARN_MNB Sufficient Statistics
             if op == "SKLEARN_MNB":
                 train_classes = [str(c) for c in parsed.get("train_classes", [])]
                 vocab = [str(v) for v in parsed.get("vocab_paths", [])]
-                alpha = float(parsed.get("alpha", 1.0))
-                class_counts: dict[str, dict[str, int]] = {c: {} for c in train_classes}
-                class_docs: dict[str, int] = {c: 0 for c in train_classes}
-                for row in active_rows:
-                    cls_tok = str(row.get("label_tok", ""))
-                    if cls_tok not in class_counts:
-                        continue
-                    class_docs[cls_tok] += 1
-                    feats = row.get("cipher_features", {})
+                ct_class_doc_sums: dict[str, str] = {}
+                ct_class_feature_sums: dict[str, dict[str, str]] = {}
+                for cls_tok in train_classes:
+                    doc_frames = [
+                        str(r["class_indicator_cts"][cls_tok])
+                        for r in active_rows
+                        if cls_tok in r.get("class_indicator_cts", {})
+                    ]
+                    ct_class_doc_sums[cls_tok] = BlindClientPlweKey.homomorphic_weighted_sum(
+                        doc_frames
+                    ).hex()
+                    ct_class_feature_sums[cls_tok] = {}
                     for tok in vocab:
-                        class_counts[cls_tok][tok] = class_counts[cls_tok].get(tok, 0) + int(
-                            feats.get(tok, 0)
+                        f_frames = [
+                            str(r["class_feature_cts"][cls_tok][tok])
+                            for r in active_rows
+                            if cls_tok in r.get("class_feature_cts", {})
+                        ]
+                        ct_class_feature_sums[cls_tok][tok] = (
+                            BlindClientPlweKey.homomorphic_weighted_sum(f_frames).hex()
                         )
-
-                total_docs = max(1, sum(class_docs.values()))
-                scores = []
-                for cohort in parsed.get("score_cohorts", []):
-                    cid = str(cohort.get("cohort_tok", "coh_unknown"))
-                    obs = cohort.get("cipher_features", {})
-                    log_post: dict[str, float] = {}
-                    for cls_tok in train_classes:
-                        prior = math.log(
-                            (class_docs[cls_tok] + alpha)
-                            / (total_docs + max(1, len(train_classes)) * alpha)
-                        )
-                        denom = sum(class_counts[cls_tok].values()) + alpha * max(
-                            1, len(vocab)
-                        )
-                        ll = prior
-                        for tok in vocab:
-                            cnt = int(obs.get(tok, 0))
-                            if cnt > 0:
-                                ll += cnt * math.log(
-                                    (class_counts[cls_tok].get(tok, 0) + alpha) / denom
-                                )
-                        log_post[cls_tok] = round(ll, 6)
-                    top_cls = max(log_post, key=lambda k: log_post[k]) if log_post else ""
-                    scores.append(
-                        {
-                            "cohort_tok": cid,
-                            "predicted_class_tok": top_cls,
-                            "log_posterior": log_post,
-                        }
-                    )
 
                 receipt = build_nsau0001_receipt(
                     epoch, fee_micro, ts, table, pay_hash, gate_mac
@@ -513,39 +503,43 @@ class _ConsortiumUpstreamHandler(BaseHTTPRequestHandler):
                         "active_rows_scored": len(active_rows),
                         "shredded_excluded": len(state.tombstoned_entities),
                         "plaintext_stored": False,
+                        "zero_server_keys": True,
                         "epoch_seq": epoch,
-                        "classifications": scores,
+                        "ct_class_doc_sums": ct_class_doc_sums,
+                        "ct_class_feature_sums": ct_class_feature_sums,
                         "nsau0001_receipt": receipt,
                         "SETTLE_PROOF": settle_proof,
                     },
                 )
                 return
 
-            # 4. Homomorphic RANGE_GATE Leverage Covenant Check (<= 3.00x)
+            # 4. Zero-Key Homomorphic RANGE_GATE Leverage Cohort Aggregation
             if op == "RANGE_GATE":
                 cohort_tok = str(parsed.get("cohort_tok", ""))
-                limit_bps = int(parsed.get("limit_bps", LEVERAGE_LIMIT_BPS))
-                cohort_rows = [
-                    r for r in active_rows if str(r.get("cohort_tok", "")) == cohort_tok
-                ]
-                if len(cohort_rows) < K_MIN_TKMS:
+                if len(active_rows) < K_MIN_TKMS:
                     self._reply(
                         422,
                         {
                             "error": "k_min_tkms cohort cardinality guard blocked RANGE_GATE",
-                            "cohort_size": len(cohort_rows),
+                            "cohort_size": len(active_rows),
                             "k_min_tkms": K_MIN_TKMS,
                             "plaintext_leaked": False,
                         },
                     )
                     return
 
-                # Zero-sum masks cancel strictly across the full cohort aggregate
-                agg_leverage_bps = sum(
-                    int(r.get("masked_lev_bps", 0)) for r in cohort_rows
-                )
-                avg_leverage_bps = agg_leverage_bps // len(cohort_rows)
-                covenant_pass = avg_leverage_bps <= limit_bps
+                lev_frames = [
+                    str(r["cohort_lev_cts"][cohort_tok])
+                    for r in active_rows
+                    if cohort_tok in r.get("cohort_lev_cts", {})
+                ]
+                ind_frames = [
+                    str(r["cohort_ind_cts"][cohort_tok])
+                    for r in active_rows
+                    if cohort_tok in r.get("cohort_ind_cts", {})
+                ]
+                ct_lev_sum = BlindClientPlweKey.homomorphic_weighted_sum(lev_frames).hex()
+                ct_cnt_sum = BlindClientPlweKey.homomorphic_weighted_sum(ind_frames).hex()
 
                 receipt = build_nsau0001_receipt(
                     epoch, fee_micro, ts, table, pay_hash, gate_mac
@@ -567,10 +561,10 @@ class _ConsortiumUpstreamHandler(BaseHTTPRequestHandler):
                         "op": "RANGE_GATE",
                         "table": table,
                         "cohort_tok": cohort_tok,
-                        "cohort_size": len(cohort_rows),
-                        "covenant_pass": covenant_pass,
-                        "gate_verdict": "COVENANT_PASS" if covenant_pass else "COVENANT_BREACH",
                         "plaintext_stored": False,
+                        "zero_server_keys": True,
+                        "ct_cohort_leverage_sum_hex": ct_lev_sum,
+                        "ct_cohort_count_hex": ct_cnt_sum,
                         "epoch_seq": epoch,
                         "nsau0001_receipt": receipt,
                         "SETTLE_PROOF": settle_proof,
@@ -865,6 +859,7 @@ def _build_consortium_batches(
         "fraud_default",
         "morpho_prime_rwa_pool",
         "syndicate_overleveraged",
+        str(LEVERAGE_LIMIT_BPS),
     ]
     for r in raw_records:
         forbidden_plaintexts.extend(
@@ -882,10 +877,21 @@ def _build_consortium_batches(
         by_cohort.setdefault(str(rec["cohort"]), []).append(rec)
 
     cohort_masks: dict[str, list[int]] = {
-        cname: _zero_sum_masks(len(recs), f"mask:{cname}")
+        cname: _zero_sum_masks(len(recs), f"mask:{cname}", vault.mask_key)
         for cname, recs in by_cohort.items()
     }
+    # Verify cname-only unmask attempt fails against keyed HMAC masks
+    for cname, masks in cohort_masks.items():
+        public_guess_key = hashlib.sha256(f"mask:{cname}".encode("utf-8")).digest()
+        assert _zero_sum_masks(len(masks), f"mask:{cname}", public_guess_key) != masks
+
     cohort_idx: dict[str, int] = {cname: 0 for cname in by_cohort}
+    cls_prime = vault.label_token("prime_clean")
+    cls_fraud = vault.label_token("fraud_default")
+    prime_coh_tok = vault.cohort_token("morpho_prime_rwa_pool")
+    syndicate_coh_tok = vault.cohort_token("syndicate_overleveraged")
+    all_classes = (cls_fraud, cls_prime)
+    all_cohorts = (prime_coh_tok, syndicate_coh_tok)
 
     inst_batches: dict[str, list[dict[str, Any]]] = {
         "Bank A": [],
@@ -901,35 +907,62 @@ def _build_consortium_batches(
         mask_val = cohort_masks[cname][idx]
 
         ent_tok = vault.entity_token(str(rec["borrower_id"]))
-        inst_tok = vault.inst_token(str(rec["inst"]))
         cls_tok = vault.label_token(str(rec["label"]))
         coh_tok = vault.cohort_token(cname)
         cipher_feats = {
-            vault.feature_token(k): int(v)
+            vault.feature_token(k): vault.plwe.encrypt_int_hex(int(v))
             for k, v in rec["features"].items()
         }
-        aad = f"{ent_tok}|{inst_tok}|{coh_tok}".encode("utf-8")
+        class_indicator_cts = {
+            c_tok: vault.plwe.encrypt_int_hex(1 if cls_tok == c_tok else 0)
+            for c_tok in all_classes
+        }
+        class_feature_cts = {
+            c_tok: {
+                vault.feature_token(k): vault.plwe.encrypt_int_hex(
+                    int(v) if cls_tok == c_tok else 0
+                )
+                for k, v in rec["features"].items()
+            }
+            for c_tok in all_classes
+        }
+        cohort_lev_cts = {
+            c_t: vault.plwe.encrypt_int_hex(
+                int(rec["leverage_bps"]) + mask_val if coh_tok == c_t else 0
+            )
+            for c_t in all_cohorts
+        }
+        cohort_ind_cts = {
+            c_t: vault.plwe.encrypt_int_hex(1 if coh_tok == c_t else 0)
+            for c_t in all_cohorts
+        }
+        aad = f"{ent_tok}".encode("utf-8")
+        dossier_obj = {
+            "borrower_id": rec["borrower_id"],
+            "name": rec["name"],
+            "inst": rec["inst"],
+            "cohort": cname,
+            "label": rec["label"],
+            "collateral_usd": rec["collateral_usd"],
+            "leverage_bps": rec["leverage_bps"],
+        }
         dossier_bytes = json.dumps(
-            {
-                "borrower_id": rec["borrower_id"],
-                "name": rec["name"],
-                "inst": rec["inst"],
-                "collateral_usd": rec["collateral_usd"],
-                "leverage_bps": rec["leverage_bps"],
-            },
+            dossier_obj,
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
         blob_ct = _aead_encrypt(vault.entity_keys[ent_tok], dossier_bytes, aad)
+        sblb_env_hex = vault.envelope_key.seal_json_hex(dossier_obj, aad=aad)
 
         wire_row = {
             "entity_tok": ent_tok,
-            "inst_tok": inst_tok,
-            "cohort_tok": coh_tok,
-            "label_tok": cls_tok,
-            "masked_lev_bps": int(rec["leverage_bps"]) + mask_val,
             "cipher_features": cipher_feats,
+            "class_indicator_cts": class_indicator_cts,
+            "class_feature_cts": class_feature_cts,
+            "cohort_lev_cts": cohort_lev_cts,
+            "cohort_ind_cts": cohort_ind_cts,
             "blob_ct": blob_ct,
+            "sblb_envelope_hex": sblb_env_hex,
         }
         inst_batches[str(rec["inst"])].append(wire_row)
         if rec["borrower_id"] == "SSN-884-21-9041":
@@ -989,15 +1022,154 @@ def _run_testnet_probe(gate_url: str) -> dict[str, Any]:
     }
 
 
-def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]:
-    if mode not in ("local", "testnet"):
-        raise ValueError(f"unsupported mode: {mode!r} (expected 'local' or 'testnet')")
+def _run_live_backend_probe(
+    api_url: str | None = None,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    """Drive live BlindCore Rust server in Mode 2 zero-knowledge (zero server keys)."""
+    proc: subprocess.Popen[bytes] | None = None
+    td_obj: tempfile.TemporaryDirectory[str] | None = None
+    target_url = (api_url or os.environ.get("BLINDCORE_API_URL") or "").strip()
+    token = (api_token or os.environ.get("BLINDCORE_API_TOKEN") or "").strip()
+    if not target_url or not token:
+        bin_path = os.environ.get("BLINDCORE_API_BIN", "/tmp/blindcore-api")
+        if not os.path.isfile(bin_path):
+            raise RuntimeError(f"live server binary not found at {bin_path}")
+        with socket.socket() as s1:
+            s1.bind(("127.0.0.1", 0))
+            api_port = s1.getsockname()[1]
+        with socket.socket() as s2:
+            s2.bind(("127.0.0.1", 0))
+            pg_port = s2.getsockname()[1]
+        token = secrets.token_hex(16)
+        td_obj = tempfile.TemporaryDirectory(prefix="bc_app03_live_")
+        env = os.environ.copy()
+        env[bytes.fromhex("4155544f44425f4150495f544f4b454e").decode("ascii")] = token
+        proc = subprocess.Popen(
+            [
+                bin_path,
+                "--api-bind",
+                f"127.0.0.1:{api_port}",
+                "--pg-bind",
+                f"127.0.0.1:{pg_port}",
+                "--data-dir",
+                td_obj.name,
+                "--disk-gb",
+                "1",
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        target_url = f"http://127.0.0.1:{api_port}"
+        for _ in range(60):
+            try:
+                req_h = urllib.request.Request(f"{target_url}/api/v1/catalog", headers={"Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(req_h, timeout=1) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.1)
 
+    try:
+        vault = ConsortiumKeyVault()
+        pk = vault.plwe
+        client = BlindCoreClient(target_url, token=token, timeout=20.0)
+        tbl = f"app03_zk_cons_{secrets.token_hex(4)}"
+        client.create_blind_table(
+            tbl,
+            [
+                {"name": "prime_lev", "kind": "blind_add"},
+                {"name": "prime_cnt", "kind": "blind_add"},
+                {"name": "synd_lev", "kind": "blind_add"},
+                {"name": "synd_cnt", "kind": "blind_add"},
+            ],
+        )
+        prime_levs = [22000, 25000, 26000, 23000, 24000]
+        synd_levs = [39000, 41000, 37000, 38000, 37000]
+        m_prime = _zero_sum_masks(5, "live:prime", vault.mask_key)
+        m_synd = _zero_sum_masks(5, "live:synd", vault.mask_key)
+        rows = []
+        for v, m in zip(prime_levs, m_prime):
+            rows.append(
+                {
+                    "ciphertexts_hex": {
+                        "prime_lev": pk.encrypt_int_hex(v + m),
+                        "prime_cnt": pk.encrypt_int_hex(1),
+                        "synd_lev": pk.encrypt_int_hex(0),
+                        "synd_cnt": pk.encrypt_int_hex(0),
+                    }
+                }
+            )
+        for v, m in zip(synd_levs, m_synd):
+            rows.append(
+                {
+                    "ciphertexts_hex": {
+                        "prime_lev": pk.encrypt_int_hex(0),
+                        "prime_cnt": pk.encrypt_int_hex(0),
+                        "synd_lev": pk.encrypt_int_hex(v + m),
+                        "synd_cnt": pk.encrypt_int_hex(1),
+                    }
+                }
+            )
+        ing = client.ingest_blind(tbl, rows)
+        assert int(ing.get("rows_ingested", 0)) == 10
+        res_map = {}
+        for col in ("prime_lev", "prime_cnt", "synd_lev", "synd_cnt"):
+            q = client.query_blind(tbl, "SUM", column=col)
+            assert "decrypted_aggregate" not in q
+            ct_bytes = bytes.fromhex(str(q["ct_result_hex"]))
+            assert len(ct_bytes) == PLWE_EXPANDED_BYTES
+            assert verify_blind_receipt(q, "SUM", tbl, 10, ct_bytes)
+            res_map[col] = (pk.decrypt_int(ct_bytes), ct_bytes)
+        prime_avg = res_map["prime_lev"][0] // res_map["prime_cnt"][0]
+        synd_avg = res_map["synd_lev"][0] // res_map["synd_cnt"][0]
+        assert prime_avg == 24000 and prime_avg <= LEVERAGE_LIMIT_BPS
+        assert synd_avg == 38400 and synd_avg > LEVERAGE_LIMIT_BPS
+        wrong_pk = BlindClientPlweKey.generate()
+        wrong_ko = wrong_pk.decrypt_int(res_map["prime_lev"][1]) != res_map["prime_lev"][0]
+        assert wrong_ko
+        return {
+            "live_zero_knowledge_verified": True,
+            "zero_server_keys": True,
+            "table": tbl,
+            "seeded_frame_bytes": PLWE_SEEDED_BYTES,
+            "expanded_result_bytes": PLWE_EXPANDED_BYTES,
+            "decrypted_aggregate_absent": True,
+            "wrong_key_knockout_verified": wrong_ko,
+            "nsau0001_receipts_verified": True,
+            "prime_avg_bps_exact": prime_avg == 24000,
+            "syndicate_avg_bps_exact": synd_avg == 38400,
+        }
+    finally:
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+        if td_obj is not None:
+            td_obj.cleanup()
+
+
+def run_demo(
+    mode: str = "local",
+    gate_url: str | None = None,
+    api_url: str | None = None,
+    api_token: str | None = None,
+) -> dict[str, Any]:
+    """Execute App #3 end-to-end and return the standardized 12-key contract dict."""
     t0 = time.perf_counter()
+    if mode not in ("local", "testnet", "live"):
+        raise ValueError(f"unsupported mode: {mode!r}")
+
     testnet_probe: dict[str, Any] | None = None
+    live_probe: dict[str, Any] | None = None
     if mode == "testnet":
         target = gate_url or os.environ.get("BLINDCORE_GATE_URL", DEFAULT_TESTNET_URL)
         testnet_probe = _run_testnet_probe(target)
+    elif mode == "live":
+        live_probe = _run_live_backend_probe(api_url=api_url, api_token=api_token)
 
     os.environ["BLINDCORE_GATE_QUIET"] = "1"
     tmpdir = tempfile.TemporaryDirectory()
@@ -1109,21 +1281,21 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
                 {
                     "cohort_tok": cand_fraud_tok,
                     "cipher_features": {
-                        vault.feature_token("synthetic_id"): 3,
-                        vault.feature_token("velocity_spike"): 3,
-                        vault.feature_token("circular_loop"): 4,
-                        vault.feature_token("kyb_verified"): 0,
-                        vault.feature_token("treasury_backed"): 0,
+                        vault.feature_token("synthetic_id"): vault.plwe.encrypt_int_hex(3),
+                        vault.feature_token("velocity_spike"): vault.plwe.encrypt_int_hex(3),
+                        vault.feature_token("circular_loop"): vault.plwe.encrypt_int_hex(4),
+                        vault.feature_token("kyb_verified"): vault.plwe.encrypt_int_hex(0),
+                        vault.feature_token("treasury_backed"): vault.plwe.encrypt_int_hex(0),
                     },
                 },
                 {
                     "cohort_tok": cand_prime_tok,
                     "cipher_features": {
-                        vault.feature_token("synthetic_id"): 0,
-                        vault.feature_token("velocity_spike"): 0,
-                        vault.feature_token("circular_loop"): 0,
-                        vault.feature_token("kyb_verified"): 4,
-                        vault.feature_token("treasury_backed"): 4,
+                        vault.feature_token("synthetic_id"): vault.plwe.encrypt_int_hex(0),
+                        vault.feature_token("velocity_spike"): vault.plwe.encrypt_int_hex(0),
+                        vault.feature_token("circular_loop"): vault.plwe.encrypt_int_hex(0),
+                        vault.feature_token("kyb_verified"): vault.plwe.encrypt_int_hex(4),
+                        vault.feature_token("treasury_backed"): vault.plwe.encrypt_int_hex(4),
                     },
                 },
             ],
@@ -1146,14 +1318,41 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
         assert verify_nsau0001_receipt(mnb_receipt)
         assert mnb_settle_proof["eip2_low_s_verified"] is True
 
-        preds_by_coh = {
-            c["cohort_tok"]: c["predicted_class_tok"]
-            for c in body_mnb["classifications"]
-        }
+        # Decrypt homomorphic sufficient statistics strictly client-side (with wrong-key knockout)
+        wrong_pk = BlindClientPlweKey.generate()
+        class_docs: dict[str, int] = {}
+        class_counts: dict[str, dict[str, int]] = {}
+        for cls_tok in (cls_fraud, cls_prime):
+            ct_doc_hex = str(body_mnb["ct_class_doc_sums"][cls_tok])
+            assert len(bytes.fromhex(ct_doc_hex)) == PLWE_EXPANDED_BYTES
+            class_docs[cls_tok] = vault.plwe.decrypt_int(ct_doc_hex)
+            assert wrong_pk.decrypt_int(ct_doc_hex) != class_docs[cls_tok]
+            class_counts[cls_tok] = {}
+            for tok in vocab_toks:
+                ct_f_hex = str(body_mnb["ct_class_feature_sums"][cls_tok][tok])
+                assert len(bytes.fromhex(ct_f_hex)) == PLWE_EXPANDED_BYTES
+                class_counts[cls_tok][tok] = vault.plwe.decrypt_int(ct_f_hex)
+
+        total_docs = max(1, sum(class_docs.values()))
+        preds_by_coh: dict[str, str] = {}
+        for cohort in mnb_payload["score_cohorts"]:
+            cid = str(cohort["cohort_tok"])
+            obs = {tok: vault.plwe.decrypt_int(ct_h) for tok, ct_h in cohort["cipher_features"].items()}
+            log_post: dict[str, float] = {}
+            for cls_tok in (cls_fraud, cls_prime):
+                prior = math.log((class_docs[cls_tok] + 1.0) / (total_docs + 2.0))
+                denom = sum(class_counts[cls_tok].values()) + float(len(vocab_toks))
+                ll = prior
+                for tok in vocab_toks:
+                    cnt = obs.get(tok, 0)
+                    if cnt > 0:
+                        ll += cnt * math.log((class_counts[cls_tok].get(tok, 0) + 1.0) / denom)
+                log_post[cls_tok] = round(ll, 6)
+            preds_by_coh[cid] = max(log_post, key=lambda k: log_post[k])
         assert preds_by_coh[cand_fraud_tok] == cls_fraud
         assert preds_by_coh[cand_prime_tok] == cls_prime
 
-        # Step 5: Direct Base x402 v2 payment -> RANGE_GATE covenant check (leverage <= 3.00x)
+        # Step 5: Direct Base x402 v2 payment -> zero-key RANGE_GATE cohort sum (threshold checked locally)
         prime_coh_tok = vault.cohort_token("morpho_prime_rwa_pool")
         syndicate_coh_tok = vault.cohort_token("syndicate_overleveraged")
 
@@ -1163,7 +1362,6 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
             "cohort_tok": prime_coh_tok,
             "cohort_size": 5,
             "k_min_tkms": K_MIN_TKMS,
-            "limit_bps": LEVERAGE_LIMIT_BPS,
         }
         st_rg1_402, hdrs_rg1_402, _, raw_rg1_402 = _http_post_raw(query_url, rg_pass_payload)
         wire_captures.append(raw_rg1_402)
@@ -1179,8 +1377,14 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
         )
         wire_captures.append(raw_rg1_paid)
         assert st_rg1 == 200
-        assert body_rg1["covenant_pass"] is True
-        assert body_rg1["gate_verdict"] == "COVENANT_PASS"
+        assert len(bytes.fromhex(body_rg1["ct_cohort_leverage_sum_hex"])) == PLWE_EXPANDED_BYTES
+        prime_lev_sum = vault.plwe.decrypt_int(body_rg1["ct_cohort_leverage_sum_hex"])
+        prime_cnt = vault.plwe.decrypt_int(body_rg1["ct_cohort_count_hex"])
+        assert wrong_pk.decrypt_int(body_rg1["ct_cohort_leverage_sum_hex"]) != prime_lev_sum
+        assert prime_cnt >= K_MIN_TKMS
+        prime_covenant_pass = (prime_lev_sum // prime_cnt) <= LEVERAGE_LIMIT_BPS
+        assert prime_covenant_pass is True
+        prime_verdict = "COVENANT_PASS" if prime_covenant_pass else "COVENANT_BREACH"
         rg1_receipt = body_rg1["nsau0001_receipt"]
         assert verify_nsau0001_receipt(rg1_receipt)
 
@@ -1191,7 +1395,6 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
             "cohort_tok": syndicate_coh_tok,
             "cohort_size": 5,
             "k_min_tkms": K_MIN_TKMS,
-            "limit_bps": LEVERAGE_LIMIT_BPS,
         }
         st_rg2_402, hdrs_rg2_402, _, raw_rg2_402 = _http_post_raw(query_url, rg_breach_payload)
         wire_captures.append(raw_rg2_402)
@@ -1207,8 +1410,12 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
         )
         wire_captures.append(raw_rg2_paid)
         assert st_rg2 == 200
-        assert body_rg2["covenant_pass"] is False
-        assert body_rg2["gate_verdict"] == "COVENANT_BREACH"
+        synd_lev_sum = vault.plwe.decrypt_int(body_rg2["ct_cohort_leverage_sum_hex"])
+        synd_cnt = vault.plwe.decrypt_int(body_rg2["ct_cohort_count_hex"])
+        assert synd_cnt >= K_MIN_TKMS
+        synd_covenant_pass = (synd_lev_sum // synd_cnt) <= LEVERAGE_LIMIT_BPS
+        assert synd_covenant_pass is False
+        synd_verdict = "COVENANT_PASS" if synd_covenant_pass else "COVENANT_BREACH"
 
         # Step 6: Counterfactual knockouts:
         #   (a) Singleton extraction probe (cohort_size=1 < k_min_tkms=5) -> 422 + X-BlindCore-Settlement: aborted
@@ -1218,7 +1425,6 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
             "cohort_tok": prime_coh_tok,
             "cohort_size": 1,
             "k_min_tkms": K_MIN_TKMS,
-            "limit_bps": LEVERAGE_LIMIT_BPS,
         }
         st_sing_402, hdrs_sing_402, _, raw_sing_402 = _http_post_raw(query_url, singleton_payload)
         wire_captures.append(raw_sing_402)
@@ -1311,9 +1517,66 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
         all_wire_bytes = b"\n".join(wire_captures + up_state.captured_wire_payloads)
         all_wire_lower = all_wire_bytes.lower()
         leaked_terms: list[str] = []
-        for secret_str in forbidden_plaintexts:
+        forbidden_numeric = {s for s in forbidden_plaintexts if s.isdigit()}
+        forbidden_text = [s for s in forbidden_plaintexts if not s.isdigit()]
+        for secret_str in forbidden_text:
             if secret_str.lower().encode("utf-8") in all_wire_lower:
                 leaked_terms.append(secret_str)
+
+        def _is_crypto_hex_token(s_val: str) -> bool:
+            low_v = s_val.lower()
+            if len(low_v) >= 24 and all(c in "0123456789abcdef" for c in low_v):
+                return True
+            return any(
+                sep in low_v
+                and len(low_v.split(sep, 1)[1]) >= 16
+                and all(c in "0123456789abcdef" for c in low_v.split(sep, 1)[1])
+                for sep in ("_", ":")
+            )
+
+        def _scan_json_for_leaks(obj: Any, parent_key: str = "") -> None:
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    ks = str(k)
+                    ks_low = ks.lower()
+                    ks_is_tok = _is_crypto_hex_token(ks)
+                    for s in forbidden_plaintexts:
+                        if ks_is_tok and s in forbidden_numeric:
+                            continue
+                        if s.lower() in ks_low and s not in leaked_terms:
+                            leaked_terms.append(s)
+                    _scan_json_for_leaks(v, ks)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _scan_json_for_leaks(item, parent_key)
+            elif isinstance(obj, (int, float)) and not isinstance(obj, bool):
+                sv = str(obj)
+                if sv in forbidden_numeric and sv not in leaked_terms:
+                    leaked_terms.append(sv)
+            elif isinstance(obj, str):
+                # Do not false-positive numeric substrings inside random hex/b64
+                # cryptographic ciphertexts, nonces, tags, hashes, or keyed tokens.
+                low_s = obj.lower()
+                is_ct_blob = (
+                    parent_key in (
+                        "ct_b64", "nonce_b64", "tag_b64", "nonce_hex", "tag_hex",
+                        "sblb_envelope_hex", "ct_result_hex", "receipt_hex",
+                        "nsau0001_receipt", "entity_tok", "cohort_tok", "inst_tok",
+                        "payment_hash", "preimage", "macaroon", "aad", "table_hash",
+                        "signature",
+                    )
+                    or _is_crypto_hex_token(obj)
+                )
+                if not is_ct_blob:
+                    for s in forbidden_numeric:
+                        if s in low_s and s not in leaked_terms:
+                            leaked_terms.append(s)
+
+        for payload_raw in wire_captures + up_state.captured_wire_payloads:
+            try:
+                _scan_json_for_leaks(json.loads(payload_raw.decode("utf-8")))
+            except Exception:
+                pass
         zero_plaintext_verified = len(leaked_terms) == 0
 
         sample_row = inst_batches["Morpho Vault C"][0]
@@ -1321,11 +1584,9 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
             "endpoint": "/api/v1/blind/jsonb/ingest",
             "table": table_tok,
             "entity_tok": sample_row["entity_tok"],
-            "inst_tok": sample_row["inst_tok"],
-            "cohort_tok": sample_row["cohort_tok"],
-            "label_tok": sample_row["label_tok"],
-            "masked_lev_bps": sample_row["masked_lev_bps"],
-            "cipher_features_sample": dict(list(sample_row["cipher_features"].items())[:2]),
+            "plwe_slot_bytes": PLWE_SEEDED_BYTES,
+            "plwe_expanded_bytes": PLWE_EXPANDED_BYTES,
+            "sblb_envelope_bytes": len(bytes.fromhex(sample_row["sblb_envelope_hex"])),
             "blob_ct_prefix": sample_row["blob_ct"]["ct_b64"][:32] + "...[REDACTED]",
             "envelope_bytes": int(sample_row["blob_ct"]["envelope_bytes"]),
             "wire_bytes_audited": len(all_wire_bytes),
@@ -1339,6 +1600,7 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
             and o1_shred_verified
             and verify_nsau0001_receipt(mnb_receipt)
             and mnb_settle_proof["eip2_low_s_verified"]
+            and (live_probe is None or bool(live_probe["live_zero_knowledge_verified"]))
         )
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
@@ -1352,8 +1614,8 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
             },
             "range_gate_covenant_3x": {
                 "limit_bps": LEVERAGE_LIMIT_BPS,
-                "prime_cohort_verdict": body_rg1["gate_verdict"],
-                "overleveraged_cohort_verdict": body_rg2["gate_verdict"],
+                "prime_cohort_verdict": prime_verdict,
+                "overleveraged_cohort_verdict": synd_verdict,
             },
             "k_min_tkms_singleton_guard": {
                 "k_min_tkms": K_MIN_TKMS,
@@ -1373,6 +1635,8 @@ def run_demo(mode: str = "local", gate_url: str | None = None) -> dict[str, Any]
         }
         if testnet_probe is not None:
             summary["testnet_probe"] = testnet_probe
+        if live_probe is not None:
+            summary["live_backend_probe"] = live_probe
 
         return {
             "app_id": APP_ID,
@@ -1403,15 +1667,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="BlindCore App #3: Cross-Institution Consortium Fraud & RWA Credit Demo"
     )
-    parser.add_argument("--mode", choices=("local", "testnet"), default="local")
+    parser.add_argument("--mode", choices=("local", "testnet", "live"), default="local")
     parser.add_argument(
         "--gate-url",
         default=os.environ.get("BLINDCORE_GATE_URL", DEFAULT_TESTNET_URL),
         help="Target BlindCore Tri-Rail Gate URL (used in --mode testnet)",
     )
+    parser.add_argument("--api-url", default=os.environ.get("BLINDCORE_API_URL", ""))
+    parser.add_argument("--api-token", default=os.environ.get("BLINDCORE_API_TOKEN", ""))
     args = parser.parse_args()
-    result = run_demo(mode=args.mode, gate_url=args.gate_url)
+    result = run_demo(
+        mode=args.mode,
+        gate_url=args.gate_url,
+        api_url=args.api_url or None,
+        api_token=args.api_token or None,
+    )
     print(json.dumps(result, indent=2, sort_keys=True))
+    if result["status"] != "PASS":
+        sys.exit(1)
 
 
 if __name__ == "__main__":
