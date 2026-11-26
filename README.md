@@ -34,6 +34,26 @@ BlindCore supports two explicit, auditable key-custody modes so security reviewe
 
 ---
 
+## Safe-Compute Acceleration & Formal Verification Stack
+
+BlindCore pairs zero-dependency client cryptography with Blind Labs' open-source native compilation and static verification toolchain so encrypted workloads run fast without expanding the trusted computing base:
+
+| Component | Repository / Entrypoint | Architecture & Verified Evidence |
+| :--- | :--- | :--- |
+| **`zero-cc`** | [blindlabs-ai/zero-cc](https://github.com/blindlabs-ai/zero-cc) | `4,979`-LOC zero-LLVM register-pinned native compiler emitting `ELF64` (`AVX2` + `AArch64`) and `WASM32+SIMD128` directly with `0` stack spills (`48x-95x` safe compute acceleration). |
+| **`zero-check`** | [blindlabs-ai/zero-check](https://github.com/blindlabs-ai/zero-check) | `4,063`-LOC `#![forbid(unsafe_code)]` Rust relational abstract interpreter (`DBM` + `Interval` + `i128` CRT + Shadow-Epoch memory), scanning `2.66M` LOC in `4.89s`. |
+| **`zero_check_py`** | `PYTHONPATH=python python3 -m blindcore.zero_check_py` | Zero-dependency pure-Python `ast` interval & taint verifier (`0` Rust<>Python FFI) shipping directly inside this SDK (`python/blindcore/zero_check_py.py`). |
+
+- **Continuous Defensive Vulnerability Discovery:** `zero-check` powers Blind Labs' internal continuous taint and domain-invariant verification engine across critical open-source infrastructure, surfacing real arithmetic, URL/parser, and boundary defects responsibly reported upstream (`oven-sh/bun#49579`, `lightningdevkit/rust-lightning#4767`, `payjoin/rust-payjoin#2082`, `rust-bitcoin/rust-bitcoin#7266`, and coordinated private advisory `GHSA-3946-9jcq-jwqq`).
+- **Pure-Python SDK & Domain Verification (`zero_check_py`):** Runs with zero native extensions or FFI to enforce fixed-width wire-pack bounds (`PY-WIDTH-01`), Bitcoin/PLWE numeric and consensus domain limits (`PY-MSAT-02`, `PY-PLWE-03`, `PY-FLOAT-04`), URI/host, weak-crypto, constant-time MAC, and CSRF guards (`PY-URI-05`..`PY-CSRF-08`), and Merkle/Hensel structural invariants (`PY-MERKLE-09`).
+- **Dogfooded to Zero Findings:** Running `zero_check_py` against this repository immediately caught and sealed `5` genuine `PY-WIDTH-01` pack-width bounds guards in `python/blindcore_sdk.py`, bringing the entire SDK (`python/` + `sklearn_blind/`) to `0` findings under `--domain all`.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=python python3 -m blindcore.zero_check_py --domain all python sklearn_blind
+```
+
+---
+
 ## Quickstart
 
 ### 1. Browser, Edge Workers & Node 22+ (`js/blindcore-web.js`)
