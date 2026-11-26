@@ -158,6 +158,7 @@ python3 eval_blindcore.py --help
 
 ```text
 python/blindcore_sdk.py           # Zero-dep Python 3 SDK (SQL, Blind OLAP/JSONB, WS, Sign, Feed, Mail)
+python/blindcore/zero_check_py.py # Zero-dep Python AST linter (width, msat, PLWE0001, URI, MAC, CSRF, Merkle)
 sklearn_blind/                    # Encrypted scikit-learn suite (23 estimators across 8 families, radix-B packing)
 js/blindcore-web.js               # Zero-dep ES2020 WebCrypto + Fetch SDK (Browser, Workers, Node 22+)
 js/blindcore-web.d.ts             # TypeScript type definitions for blindcore-web.js
@@ -188,6 +189,8 @@ Run the complete local verification suite with zero network calls and zero bytec
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_sdk.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_zero_check_py.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=python python3 -m blindcore.zero_check_py --domain all sklearn_blind/
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_live_zero_knowledge_audit.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_sklearn_blind.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_ui_self_test.py

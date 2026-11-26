@@ -242,13 +242,16 @@ class ApiError(RuntimeError):
 def pad2(data: Union[bytes, str], min_block: int = 256) -> bytes:
     """Power-of-2 PAD2 length-hiding padding: [u32_be len][payload][zero pad]."""
     raw = data.encode("utf-8") if isinstance(data, str) else bytes(data)
-    needed = 4 + len(raw)
+    raw_len = len(raw)
+    if not (0 <= raw_len <= 0xFFFFFFFF):
+        raise ValueError("PAD2 payload length exceeds uint32 maximum")
+    needed = 4 + raw_len
     size = max(16, min_block)
     if size & (size - 1) != 0:
         size = 1 << (size - 1).bit_length()
     while size < needed:
         size *= 2
-    header = len(raw).to_bytes(4, "big")
+    header = raw_len.to_bytes(4, "big")
     return header + raw + bytes(size - needed)
 
 
@@ -1651,6 +1654,9 @@ def _pack_plwe_expanded(a: list[int], b: int) -> bytes:
         buf[i * 16 : (i + 1) * 16] = (ai % q0).to_bytes(16, "little")
     buf[LWE_DIM * 16 : (LWE_DIM + 1) * 16] = (b % q0).to_bytes(16, "little")
     payload = bytes(buf)
+    plen = len(payload)
+    if not (0 <= plen <= 0xFFFFFFFF):
+        raise ValueError("PLWE0001 payload length exceeds uint32 maximum")
     hdr60 = PLWE_MAGIC + struct.pack(
         "<HBBIQQq16sI",
         1,
@@ -1661,7 +1667,7 @@ def _pack_plwe_expanded(a: list[int], b: int) -> bytes:
         1,
         1,
         bytes(16),
-        len(payload),
+        plen,
     )
     crc = crc32c(hdr60 + payload)
     return hdr60 + struct.pack("<I", crc) + payload
@@ -2043,6 +2049,8 @@ def _ghash(h_int: int, aad: bytes, ct: bytes) -> bytes:
             y = _gf128_mul(y ^ blk, h_int)
     lens = ((len(aad) * 8) << 64) | (len(ct) * 8)
     y = _gf128_mul(y ^ lens, h_int)
+    if not (0 <= y <= (1 << 128) - 1):
+        raise ValueError("GHASH state out of uint128 range")
     return y.to_bytes(16, "big")
 
 
@@ -2121,15 +2129,16 @@ class BlindClientEnvelopeKey:
         if not isinstance(plaintext, (bytes, bytearray)):
             raise TypeError("plaintext must be bytes")
         pt = bytes(plaintext)
-        need = 4 + len(pt)
+        pt_len = len(pt)
+        need = 4 + pt_len
         bucket = 0
         for cand in SBLB_BUCKETS:
             if cand >= need:
                 bucket = cand
                 break
-        if bucket == 0:
+        if bucket == 0 or not (0 <= pt_len <= 0xFFFFFFFF):
             raise ValueError(f"plaintext too large for SBLB0001 max bucket ({SBLB_BUCKETS[-1] - 4} B)")
-        padded = struct.pack(">I", len(pt)) + pt + bytes(bucket - need)
+        padded = struct.pack(">I", pt_len) + pt + bytes(bucket - need)
         nonce = os.urandom(12)
         hdr24 = SBLB_MAGIC + struct.pack("<HH", 1, bucket) + nonce
         ct_tag = self._aead.encrypt(nonce, padded, hdr24 + aad)
@@ -2245,12 +2254,15 @@ def verify_blind_receipt(
     got = resp.get("receipt_hex")
     if not isinstance(got, str) or len(got) != 64:
         return False
+    cnt = int(count)
+    if not (0 <= cnt <= 0xFFFFFFFFFFFFFFFF):
+        raise ValueError("receipt count out of uint64 range")
     expected = hashlib.sha256(
         b"NSAU0001:BLIND:"
         + kind.encode("utf-8")
         + b":"
         + table.encode("utf-8")
-        + struct.pack("<Q", int(count))
+        + struct.pack("<Q", cnt)
         + payload
     ).hexdigest()
     return hmac.compare_digest(got.lower(), expected)

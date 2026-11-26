@@ -1,5 +1,10 @@
 """BlindCore zero-dependency Python 3 SDK package."""
 
+from .blindcore.zero_check_py import (
+    Finding,
+    check_ast_module,
+    check_ast_path,
+)
 from .blindcore_sdk import (
     LWE_DIM,
     LWE_PLAIN_MOD,
@@ -49,5 +54,8 @@ __all__ = [
     "sha256_hex",
     "to_base64url",
     "unpad2",
+    "Finding",
+    "check_ast_module",
+    "check_ast_path",
     "verify_blind_receipt",
 ]
